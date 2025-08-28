@@ -31,33 +31,46 @@ impl MessageStreamer {
     pub async fn receive_loop(&mut self) -> Result<(), paho_mqtt::Error> {
         info!("Starting message receive loop...");
         while let Some(msg_opt) = self.strm.next().await {
-            if let Some(msg) = msg_opt {
-                let mut sub_id_itr = msg.properties().iter(mqtt::PropertyCode::SubscriptionIdentifier);
-                while let Some(sub_id_prop) = sub_id_itr.next() {
-                    let opt_sub_id = sub_id_prop.get_int();
-                    if let Some(sub_id) = opt_sub_id {
-                        if let Some(tx) = self.subscriptions.lock().unwrap().get(&sub_id) {
-                            let tx2 = tx.clone();
-                            let received_msg = ReceivedMessage {
-                                message: msg.clone(),
-                                subscription_id: sub_id,
-                            };
-                            tokio::spawn(async move {
-                                if let Err(e) = tx2.send(received_msg).await {
-                                    error!("Failed to send message: {}", e);
+            match msg_opt {
+                Some(msg) => {
+                    let mut sub_id_itr = msg.properties().iter(mqtt::PropertyCode::SubscriptionIdentifier);
+                    let mut found_sub_id = false;
+                    while let Some(sub_id_prop) = sub_id_itr.next() {
+                        let opt_sub_id = sub_id_prop.get_int();
+                        if let Some(sub_id) = opt_sub_id {
+                            found_sub_id = true;
+                            let tx_opt = self.subscriptions.lock();
+                            match tx_opt {
+                                Ok(subs) => {
+                                    if let Some(tx) = subs.get(&sub_id) {
+                                        let tx2 = tx.clone();
+                                        let received_msg = ReceivedMessage {
+                                            message: msg.clone(),
+                                            subscription_id: sub_id,
+                                        };
+                                        tokio::spawn(async move {
+                                            if let Err(e) = tx2.send(received_msg).await {
+                                                error!("Failed to send message: {}", e);
+                                            }
+                                        });
+                                    } else {
+                                        warn!("No subscription found for ID: {}", sub_id);
+                                    }
                                 }
-                            });
-                        } else {
-                            warn!("No subscription found for ID: {}", sub_id);
-                        } 
-                    } else {
+                                Err(e) => {
+                                    error!("Failed to lock subscriptions map: {}", e);
+                                }
+                            }
+                        }
+                    }
+                    if !found_sub_id {
                         warn!("No subscription ID found in message properties.");
                     }
                 }
-            } else {
-                info!("Received None, stream closed.");
+                None => {
+                    info!("Received None, stream closed.");
+                }
             }
-    
         }
         Ok(())
     }
@@ -241,9 +254,16 @@ impl Connection {
         subscription_id: i32,
         tx: Sender<ReceivedMessage>,
     ) -> Result<(), paho_mqtt::Error> {
-        let mut subscriptions = self.subscriptions.lock().unwrap();
-        subscriptions.insert(subscription_id, tx);
-        Ok(())
+        match self.subscriptions.lock() {
+            Ok(mut subscriptions) => {
+                subscriptions.insert(subscription_id, tx);
+                Ok(())
+            }
+            Err(e) => {
+                error!("Failed to lock subscriptions map: {}", e);
+                Err(paho_mqtt::Error::General("Failed to lock subscriptions map".into()))
+            }
+        }
     }
 
     /// Subscribes to a topic and registers a channel for received messages.
@@ -252,9 +272,17 @@ impl Connection {
         let sub_opts = mqtt::SubscribeOptions::new(true, false, mqtt::RetainHandling::SendRetainedOnSubscribe);
         let mut sub_props = mqtt::Properties::new();
         let subscription_id = self.get_subscription_id();
-        let si_prop =  mqtt::Property::new(mqtt::PropertyCode::SubscriptionIdentifier, subscription_id as i32).unwrap();
+        let si_prop =  mqtt::Property::new(mqtt::PropertyCode::SubscriptionIdentifier, subscription_id as i32)
+            .map_err(|e| {
+                error!("Failed to create subscription property: {:?}", e);
+                paho_mqtt::Error::General("Failed to create subscription property".into())
+            })?;
         let _ = sub_props.push(si_prop);
-        let _sub_result = self.client.subscribe_with_options(topic, paho_mqtt::QOS_1, sub_opts, sub_props).await;
+        let sub_result = self.client.subscribe_with_options(topic, paho_mqtt::QOS_1, sub_opts, sub_props).await;
+        if let Err(e) = sub_result {
+            error!("Failed to subscribe to topic {}: {:?}", topic, e);
+            return Err(e);
+        }
         self.add_subscription_receiver(subscription_id, tx).await?;
         Ok(subscription_id)
     }
@@ -265,19 +293,24 @@ impl Connection {
 
         let mut streamer = self.get_streamer().await;
         let _stream_task = tokio::spawn(async move {
-            let _ = streamer.receive_loop().await;
+            if let Err(e) = streamer.receive_loop().await {
+                error!("Error in receive loop: {:?}", e);
+            }
         });
 
         loop {
-            let opt_msg = self.pub_chan_rx.recv().await;
-            if let Some(msg) = opt_msg {
-                let pub_result = self.publish(msg).await;
-                match pub_result {
-                    Ok(_r) => info!("Message was published"),
-                    Err(e) => error!("Error publishing: {:?}", e),
+            match self.pub_chan_rx.recv().await {
+                Some(msg) => {
+                    match self.publish(msg).await {
+                        Ok(_r) => info!("Message was published"),
+                        Err(e) => error!("Error publishing: {:?}", e),
+                    }
+                }
+                None => {
+                    warn!("Publisher channel closed, breaking loop.");
+                    break;
                 }
             }
         }
     }
-
 }
