@@ -1,5 +1,3 @@
-
-
 extern crate paho_mqtt as mqtt;
 use uuid::Uuid;
 use futures::{StreamExt};
@@ -11,6 +9,7 @@ use std::time::Duration;
 use std::sync::{Arc, Mutex};
 use serde::Serialize;
 use serde_json::{self};
+use log::{info, warn, error};
 
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
@@ -26,7 +25,7 @@ pub struct MessageStreamer {
 
 impl MessageStreamer {
     pub async fn receive_loop(&mut self) -> Result<(), paho_mqtt::Error> {
-        println!("Starting message receive loop...");
+        info!("Starting message receive loop...");
         while let Some(msg_opt) = self.strm.next().await {
             if let Some(msg) = msg_opt {
                 let mut sub_id_itr = msg.properties().iter(mqtt::PropertyCode::SubscriptionIdentifier);
@@ -41,18 +40,18 @@ impl MessageStreamer {
                             };
                             tokio::spawn(async move {
                                 if let Err(e) = tx2.send(received_msg).await {
-                                    eprintln!("Failed to send message: {}", e);
+                                    error!("Failed to send message: {}", e);
                                 }
                             });
                         } else {
-                            println!("No subscription found for ID: {}", sub_id);
+                            warn!("No subscription found for ID: {}", sub_id);
                         } 
                     } else {
-                        println!("No subscription ID found in message properties.");
+                        warn!("No subscription ID found in message properties.");
                     }
                 }
             } else {
-                println!("Received None, stream closed.");
+                info!("Received None, stream closed.");
             }
     
         }
@@ -67,7 +66,7 @@ pub struct MessagePublisher {
 
 impl MessagePublisher {
     pub async fn publish(&mut self, msg: mqtt::Message) -> Result<(), SendError<Message>> {
-        println!("Message publisher publishing message to {}", msg.topic());
+        info!("Message publisher publishing message to {}", msg.topic());
         self.channel.send(msg).await
     }
 
@@ -104,7 +103,7 @@ impl MessagePublisher {
     }
 
     pub async fn publish_request_structure<T: Serialize>(&mut self, topic: String, data: &T, response_topic: &str, correlation_id: Uuid) -> Result<(), SendError<Message>> {
-        println!("Publishing request structure to {} with responses going to {}", topic, response_topic);
+        info!("Publishing request structure to {} with responses going to {}", topic, response_topic);
         let uuid_vec: Vec<u8> = correlation_id.as_bytes().to_vec();
         let mut pub_props = mqtt::Properties::new();
         let _ = pub_props.push_binary(mqtt::PropertyCode::CorrelationData, uuid_vec);
@@ -148,7 +147,7 @@ pub struct Connection {
 
 impl Connection {
     pub async fn new(broker: &str) -> Result<Self, paho_mqtt::Error> {
-        println!("Creating new connection object");
+        info!("Creating new connection object");
         let client_id_uuid = Uuid::new_v4();
         let client_id = client_id_uuid.to_string();
         let create_opts = mqtt::CreateOptionsBuilder::new()
@@ -197,7 +196,7 @@ impl Connection {
     }
 
     pub async fn connect(&self) -> Result<paho_mqtt::ServerResponse, paho_mqtt::Error> {
-        println!("Connecting to mqtt");
+        info!("Connecting to mqtt");
         let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
             .keep_alive_interval(Duration::from_secs(20))
             .clean_start(true)
@@ -211,7 +210,7 @@ impl Connection {
     }
     
     pub async fn publish(&self, msg: mqtt::Message) -> Result<(), paho_mqtt::Error> {
-        println!("Publishing message to {}", msg.topic());
+        info!("Publishing message to {}", msg.topic());
         let pub_result = self.client.publish(msg).await;
         pub_result
     }
@@ -227,7 +226,7 @@ impl Connection {
     }
 
     pub async fn subscribe(&mut self, topic: &str, tx: Sender<ReceivedMessage>) -> Result<i32, paho_mqtt::Error> {
-        println!("Subscribing to {}", topic);
+        info!("Subscribing to {}", topic);
         let sub_opts = mqtt::SubscribeOptions::new(true, false, mqtt::RetainHandling::SendRetainedOnSubscribe);
         let mut sub_props = mqtt::Properties::new();
         let subscription_id = self.get_subscription_id();
@@ -239,7 +238,7 @@ impl Connection {
     }
 
     pub async fn start_loop(&mut self) {
-        println!("Starting MQTT loop...");
+        info!("Starting MQTT loop...");
 
         let mut streamer = self.get_streamer().await;
         let _stream_task = tokio::spawn(async move {
@@ -251,8 +250,8 @@ impl Connection {
             if let Some(msg) = opt_msg {
                 let pub_result = self.publish(msg).await;
                 match pub_result {
-                    Ok(_r) => println!("Message was published"),
-                    Err(e) => eprintln!("Error publishing: {:?}", e),
+                    Ok(_r) => info!("Message was published"),
+                    Err(e) => error!("Error publishing: {:?}", e),
                 }
             }
         }
