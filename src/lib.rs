@@ -362,7 +362,7 @@ impl MqttierClient {
                                 qos: publish.qos,
                                 subscription_id: subscription_id,
                                 response_topic: response_topic.clone(),
-                                correlation_data: correlation_data.map(|data| data.to_vec()),
+                                correlation_data: correlation_data.clone().map(|data| data.to_vec()),
                                 content_type: content_type.clone(),
                             };
                             let state_guard = state.read().await;
