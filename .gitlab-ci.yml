@@ -1,0 +1,29 @@
+stages:
+  - build
+  - test
+
+variables:
+  CARGO_TERM_COLOR: always
+
+build:
+  stage: build
+  image: rust:latest
+  script:
+    - cargo build --verbose
+  artifacts:
+    paths:
+      - target/debug/
+    expire_in: 1 week
+
+unit_test:
+  stage: test
+  image: rust:latest
+  script:
+    - cargo test --verbose -- --format=json > test-results.json || true
+  artifacts:
+    when: always
+    paths:
+      - test-results.json
+    reports:
+      junit: test-results.json
+    expire_in: 1 week

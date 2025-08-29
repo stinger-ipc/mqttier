@@ -1,316 +1,408 @@
-extern crate paho_mqtt as mqtt;
-use uuid::Uuid;
-use futures::{StreamExt};
-use mqtt::{Message, QOS_1, QOS_2};
+//! # MQTTier
+//! 
+//! A Rust MQTT client library providing an abstracted interface around rumqttc.
+
 use std::collections::HashMap;
-use tokio::sync::mpsc::{self, Sender, Receiver};
-use tokio::sync::mpsc::error::SendError;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
-use std::sync::{Arc, Mutex};
+
+use log::{debug, error, info, warn};
+use rumqttc::v5::{MqttOptions, AsyncClient, EventLoop, Event};
+use rumqttc::v5::mqttbytes::v5::{PublishProperties, SubscribeProperties, Packet};
+use rumqttc::v5::mqttbytes::{QoS};
 use serde::Serialize;
-use serde_json::{self};
-use log::{info, warn, error};
+use thiserror::Error;
+use tokio::sync::{mpsc, Mutex, RwLock};
+use uuid::Uuid;
 
+/// Errors that can occur when using MqttierClient
+#[derive(Error, Debug)]
+pub enum MqttierError {
+    #[error("MQTT connection error: {0}")]
+    ConnectionError(#[from] rumqttc::v5::ConnectionError),
+    #[error("MQTT client error: {0}")]
+    ClientError(#[from] rumqttc::v5::ClientError),
+    #[error("Serialization error: {0}")]
+    SerializationError(#[from] serde_json::Error),
+    #[error("Channel send error")]
+    ChannelSendError,
+}
 
-/// Represents a message received from an MQTT subscription, along with its subscription ID.
-#[derive(Clone, Debug)]
+type Result<T> = std::result::Result<T, MqttierError>;
+
+/// Represents a queued subscription
+#[derive(Debug, Clone)]
+struct QueuedSubscription {
+    topic: String,
+    qos: QoS,
+    props: SubscribeProperties,
+}
+
+/// Represents a queued message to publish
+#[derive(Debug, Clone)]
+struct QueuedMessage {
+    topic: String,
+    payload: Vec<u8>,
+    qos: QoS,
+    retain: bool,
+    publish_props: PublishProperties,
+}
+
+/// A message received from a subscription
+#[derive(Debug, Clone)]
 pub struct ReceivedMessage {
-    pub message: mqtt::Message,
-    pub subscription_id: i32,
+    pub topic: String,
+    pub payload: Vec<u8>,
+    pub qos: QoS,
+    pub subscription_id: usize,
+    pub response_topic: Option<String>,
+    pub content_type: Option<String>,
+    pub correlation_data: Option<Vec<u8>>,
 }
 
-/// Streams messages from the MQTT broker and dispatches them to the appropriate subscription channels.
+/// Internal state of the MqttierClient
+#[derive(Debug)]
+struct ClientState {
+    is_connected: bool,
+    subscriptions: HashMap<usize, mpsc::UnboundedSender<ReceivedMessage>>,
+    queued_subscriptions: Vec<QueuedSubscription>,
+    queued_messages: Vec<QueuedMessage>,
+}
+
+impl Default for ClientState {
+    fn default() -> Self {
+        Self {
+            is_connected: false,
+            subscriptions: HashMap::new(),
+            queued_subscriptions: Vec::new(),
+            queued_messages: Vec::new(),
+        }
+    }
+}
+
+/// MqttierClient provides an abstracted interface around rumqttc
 #[derive(Clone)]
-pub struct MessageStreamer {
-    pub subscriptions: Arc<Mutex<HashMap<i32, Sender<ReceivedMessage>>>>,
-    pub strm: mqtt::AsyncReceiver<Option<mqtt::Message>>
+pub struct MqttierClient {
+    client: AsyncClient,
+    state: Arc<RwLock<ClientState>>,
+    next_subscription_id: Arc<AtomicUsize>,
+    is_running: Arc<Mutex<bool>>,
+    eventloop: Arc<Mutex<Option<EventLoop>>>,
 }
 
-impl MessageStreamer {
-    /// Runs the receive loop, dispatching incoming messages to the correct subscription channel.
-    pub async fn receive_loop(&mut self) -> Result<(), paho_mqtt::Error> {
-        info!("Starting message receive loop...");
-        while let Some(msg_opt) = self.strm.next().await {
-            match msg_opt {
-                Some(msg) => {
-                    let mut sub_id_itr = msg.properties().iter(mqtt::PropertyCode::SubscriptionIdentifier);
-                    let mut found_sub_id = false;
-                    while let Some(sub_id_prop) = sub_id_itr.next() {
-                        let opt_sub_id = sub_id_prop.get_int();
-                        if let Some(sub_id) = opt_sub_id {
-                            found_sub_id = true;
-                            let tx_opt = self.subscriptions.lock();
-                            match tx_opt {
-                                Ok(subs) => {
-                                    if let Some(tx) = subs.get(&sub_id) {
-                                        let tx2 = tx.clone();
-                                        let received_msg = ReceivedMessage {
-                                            message: msg.clone(),
-                                            subscription_id: sub_id,
-                                        };
-                                        tokio::spawn(async move {
-                                            if let Err(e) = tx2.send(received_msg).await {
-                                                error!("Failed to send message: {}", e);
-                                            }
-                                        });
-                                    } else {
-                                        warn!("No subscription found for ID: {}", sub_id);
-                                    }
-                                }
-                                Err(e) => {
-                                    error!("Failed to lock subscriptions map: {}", e);
+impl MqttierClient {
+    /// Create a new MqttierClient
+    /// 
+    /// # Arguments
+    /// 
+    /// * `hostname` - The hostname of the MQTT broker
+    /// * `port` - The port of the MQTT broker
+    /// * `client_id` - Optional client ID. If None, a random UUID will be generated
+    pub fn new(hostname: &str, port: u16, client_id: Option<String>) -> Result<Self> {
+        let client_id = client_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+        
+        let mut mqttoptions = MqttOptions::new(client_id, hostname, port);
+        mqttoptions.set_keep_alive(Duration::from_secs(60));
+        mqttoptions.set_clean_start(true);
+
+        let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+
+        Ok(Self {
+            client,
+            state: Arc::new(RwLock::new(ClientState::default())),
+            next_subscription_id: Arc::new(AtomicUsize::new(5)),
+            is_running: Arc::new(Mutex::new(false)),
+            eventloop: Arc::new(Mutex::new(Some(eventloop))),
+        })
+    }
+
+    /// Get the next subscription id value
+    fn next_subscription_id(&self) -> usize {
+        self.next_subscription_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Subscribe to a topic
+    /// 
+    /// # Arguments
+    /// 
+    /// * `topic` - The topic to subscribe to
+    /// * `qos` - The QoS level for the subscription
+    /// 
+    /// # Returns
+    /// 
+    /// Returns a subscription ID and a receiver for messages on this topic
+    pub async fn subscribe(&self, topic: String, qos: QoS, received_message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<usize> {
+        let subscription_id = self.next_subscription_id();
+
+        let mut state = self.state.write().await;
+        state.subscriptions.insert(subscription_id, received_message_tx);
+        let subscription_props = SubscribeProperties {
+            id: Some(subscription_id),
+            user_properties: Vec::new(),
+        };
+        if state.is_connected {
+            debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
+            self.client.subscribe_with_properties(&topic, qos, subscription_props).await?;
+        } else {
+            debug!("Queueing subscription for topic: {} with QoS: {:?}", topic, qos);
+            state.queued_subscriptions.push(QueuedSubscription {
+                topic,
+                qos,
+                props: subscription_props,
+            });
+        }
+
+        Ok(subscription_id)
+    }
+
+    /// Publish a message to a topic
+    /// 
+    /// # Arguments
+    /// 
+    /// * `topic` - The topic to publish to
+    /// * `message` - The message to publish (must be serializable)
+    /// * `qos` - The QoS level for the message
+    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS, retain: bool, publish_props: Option<PublishProperties>) -> Result<()> {
+        let mut state = self.state.write().await;
+        let publish_props = publish_props.unwrap_or_default();
+        if state.is_connected {
+            debug!("Publishing message to topic: {} with QoS: {:?}", topic, qos);
+            self.client.publish_with_properties(&topic, qos, retain, payload, publish_props).await?;
+        } else {
+            debug!("Queueing message for topic: {} with QoS: {:?}", topic, qos);
+            state.queued_messages.push(QueuedMessage {
+                topic,
+                payload,
+                qos,
+                retain,
+                publish_props,
+            });
+        }
+
+        Ok(())
+    }
+    /// Publish a structure message to a topic
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `payload` - The serializable struct to send as payload
+    /// * `state_version` - The version of the structure
+    pub async fn publish_structure<T: Serialize>(
+        &self,
+        topic: String,
+        payload: T,
+    ) -> Result<()> {
+        let mut props = PublishProperties::default();
+        props.content_type = Some("application/json".to_string());
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+    }
+
+    /// Publish a request message to a topic with response topic and correlation id
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `payload` - The serializable struct to send as payload
+    /// * `response_topic` - The topic where responses should be sent
+    /// * `correlation_id` - The correlation id for matching responses
+    pub async fn publish_request<T: Serialize>(
+        &self,
+        topic: String,
+        payload: T,
+        response_topic: String,
+        correlation_id: Vec<u8>,
+    ) -> Result<()> {
+        let mut props = PublishProperties::default();
+        props.response_topic = Some(response_topic);
+        props.correlation_data = Some(correlation_id.into());
+        props.content_type = Some("application/json".to_string());
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+    }
+
+    /// Publish a response message to a topic with correlation id
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `payload` - The serializable struct to send as payload
+    /// * `correlation_id` - The correlation id for matching requests
+    pub async fn publish_response<T: Serialize>(
+        &self,
+        topic: String,
+        payload: T,
+        correlation_id: Vec<u8>,
+    ) -> Result<()> {
+        let mut props = PublishProperties::default();
+        props.content_type = Some("application/json".to_string());
+        props.correlation_data = Some(correlation_id.into());
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+    }
+
+    /// Publish a state message to a topic
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `payload` - The serializable struct to send as payload
+    pub async fn publish_state<T: Serialize>(
+        &self,
+        topic: String,
+        payload: T,
+        state_version: u32,
+    ) -> Result<()> {
+        let mut props = PublishProperties::default();
+        props.user_properties.push((
+            "PropertyVersion".to_string(),
+            state_version.to_string(),
+        ));
+        props.content_type = Some("application/json".to_string());
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, None).await
+    }
+
+    /// Start the run loop for handling MQTT connections and messages
+    pub async fn run_loop(&self) -> Result<()> {
+        let mut is_running = self.is_running.lock().await;
+        if *is_running {
+            debug!("Run loop is already running");
+            return Ok(());
+        }
+        *is_running = true;
+        drop(is_running);
+
+        let client = self.client.clone();
+        let state = self.state.clone();
+        let eventloop = self.eventloop.clone();
+
+        tokio::spawn(async move {
+            loop {
+                info!("Starting MQTT connection loop");
+                
+                // Take ownership of the eventloop
+                let mut eventloop_guard = eventloop.lock().await;
+                if let Some(mut el) = eventloop_guard.take() {
+                    drop(eventloop_guard);
+                    
+                    match Self::handle_connection(&client, &mut el, &state).await {
+                        Ok(_) => {
+                            info!("MQTT connection loop ended normally");
+                        }
+                        Err(e) => {
+                            error!("MQTT connection error: {}", e);
+                        }
+                    }
+                } else {
+                    error!("EventLoop not available");
+                    break;
+                }
+
+                // Mark as disconnected
+                {
+                    let mut state_guard = state.write().await;
+                    state_guard.is_connected = false;
+                }
+
+                // Wait before reconnecting
+                warn!("Reconnecting in 5 seconds...");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Handle a single MQTT connection
+    async fn handle_connection(
+        client: &AsyncClient,
+        eventloop: &mut EventLoop,
+        state: &Arc<RwLock<ClientState>>,
+    ) -> Result<()> {
+        loop {
+            match eventloop.poll().await {
+                Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                    info!("Connected to MQTT broker");
+                    
+                    let mut state_guard = state.write().await;
+                    state_guard.is_connected = true;
+
+                    // Process queued subscriptions
+                    for subscription in state_guard.queued_subscriptions.drain(..) {
+                        debug!("Processing queued subscription for topic: {}", subscription.topic);
+                        if let Err(e) = client.subscribe_with_properties(&subscription.topic, subscription.qos, subscription.props).await {
+                            error!("Failed to subscribe to {}: {}", subscription.topic, e);
+                        }
+                    }
+
+                    // Process queued messages
+                    for message in state_guard.queued_messages.drain(..) {
+                        debug!("Processing queued message for topic: {}", message.topic);
+                        if let Err(e) = client.publish_with_properties(&message.topic, message.qos, message.retain, message.payload, message.publish_props).await {
+                            error!("Failed to publish to {}: {}", message.topic, e);
+                        }
+                    }
+                }
+                Ok(Event::Incoming(Packet::Publish(publish))) => {
+                    let topic_str = String::from_utf8_lossy(&publish.topic).to_string();
+                    debug!("Received message on topic: {}", topic_str);
+
+                    if let Some(pub_props) = publish.properties {
+                        let subscription_ids = pub_props.subscription_identifiers;
+                        let correlation_data = pub_props.correlation_data;
+                        let response_topic = pub_props.response_topic;
+                        let content_type = pub_props.content_type;
+                        for subscription_id in subscription_ids {
+                            let message = ReceivedMessage {
+                                topic: topic_str.clone(),
+                                payload: publish.payload.to_vec(),
+                                qos: publish.qos,
+                                subscription_id: subscription_id,
+                                response_topic: response_topic.clone(),
+                                correlation_data: correlation_data.map(|data| data.to_vec()),
+                                content_type: content_type.clone(),
+                            };
+                            let state_guard = state.read().await;
+                            if let Some(sender) = state_guard.subscriptions.get(&subscription_id) {
+                                if let Err(_) = sender.send(message.clone()) {
+                                    warn!("Failed to send message to subscription {}", subscription_id);
                                 }
                             }
                         }
                     }
-                    if !found_sub_id {
-                        warn!("No subscription ID found in message properties.");
-                    }
                 }
-                None => {
-                    info!("Received None, stream closed.");
+                Ok(Event::Incoming(packet)) => {
+                    debug!("Received packet: {:?}", packet);
                 }
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Publishes messages to the MQTT broker using an internal channel.
-#[derive(Clone)]
-pub struct MessagePublisher {
-    pub channel: Sender<mqtt::Message>
-}
-
-impl MessagePublisher {
-    /// Publishes a raw MQTT message.
-    pub async fn publish(&mut self, msg: mqtt::Message) -> Result<(), SendError<Message>> {
-        info!("Message publisher publishing message to {}", msg.topic());
-        self.channel.send(msg).await
-    }
-
-    /// Publishes a simple string payload to a topic.
-    pub async fn publish_simple(&mut self, topic: String, payload: String) -> Result<(), SendError<Message>> {
-        let msg = mqtt::Message::new(topic, payload, QOS_1);
-        self.publish(msg).await
-    }
-
-    /// Publishes a serializable structure as JSON to a topic.
-    pub async fn publish_structure<T: Serialize>(&mut self, topic: String, data: &T) -> Result<(), SendError<Message>> {
-        let payload = serde_json::to_string(data).unwrap().into_bytes();
-        let mut pub_props = mqtt::Properties::new();
-        let _ = pub_props.push_string(mqtt::PropertyCode::ContentType, "application/json");
-        let msg = mqtt::MessageBuilder::new()
-            .topic(topic)
-            .payload(payload)
-            .properties(pub_props)
-            .qos(QOS_1)
-            .finalize();
-        self.publish(msg).await
-    }
-
-    /// Publishes a retained serializable structure as JSON to a topic.
-    pub async fn publish_retained_structure<T: Serialize>(&mut self, topic: String, data: &T) -> Result<(), SendError<Message>> {
-        let payload = serde_json::to_string(data).unwrap().into_bytes();
-        let mut pub_props = mqtt::Properties::new();
-        let _ = pub_props.push_string(mqtt::PropertyCode::ContentType, "application/json");
-        let msg = mqtt::MessageBuilder::new()
-            .topic(topic)
-            .payload(payload)
-            .properties(pub_props)
-            .qos(QOS_1)
-            .retained(true)
-            .finalize();
-        self.publish(msg).await
-    }
-
-    /// Publishes a request structure with response topic and correlation ID for request/response patterns.
-    pub async fn publish_request_structure<T: Serialize>(&mut self, topic: String, data: &T, response_topic: &str, correlation_id: Uuid) -> Result<(), SendError<Message>> {
-        info!("Publishing request structure to {} with responses going to {}", topic, response_topic);
-        let uuid_vec: Vec<u8> = correlation_id.as_bytes().to_vec();
-        let mut pub_props = mqtt::Properties::new();
-        let _ = pub_props.push_binary(mqtt::PropertyCode::CorrelationData, uuid_vec);
-        let _ = pub_props.push_string(mqtt::PropertyCode::ResponseTopic, response_topic);
-        let _ = pub_props.push_string(mqtt::PropertyCode::ContentType, "application/json");
-        let payload = serde_json::to_string(data).unwrap().into_bytes();
-        let msg = mqtt::MessageBuilder::new()
-            .topic(topic)
-            .qos(QOS_2)
-            .properties(pub_props)
-            .payload(payload)
-            .finalize();
-        self.publish(msg).await
-    }
-
-    /// Publishes a response structure, optionally including a correlation ID.
-    pub async fn publish_response_structure<T: Serialize>(&mut self, topic: String, data: &T, correlation_id: Option<Vec<u8>>) -> Result<(), SendError<Message>> {
-        let mut pub_props = mqtt::Properties::new();
-        if let Some(corr_id) = correlation_id {
-            let _ = pub_props.push_binary(mqtt::PropertyCode::CorrelationData, corr_id);
-        }
-        let payload = serde_json::to_string(data).unwrap().into_bytes();
-        let _ = pub_props.push_string(mqtt::PropertyCode::ContentType, "application/json");
-        let msg = mqtt::MessageBuilder::new()
-            .topic(topic)
-            .payload(payload)
-            .qos(QOS_2)
-            .properties(pub_props)
-            .finalize();
-        self.publish(msg).await
-    }
-}
-
-/// Represents an MQTT connection, including client, subscriptions, and publisher channel.
-pub struct Connection {
-    pub client: paho_mqtt::AsyncClient,
-    pub client_id: String,
-    pub next_subscription_id: i32,
-    pub subscriptions: Arc<Mutex<HashMap<i32, Sender<ReceivedMessage>>>>,
-    pub pub_chan_rx: Receiver<mqtt::Message>,
-    pub pub_chan_tx: Sender<mqtt::Message>,
-}
-
-impl Connection {
-    /// Creates a new MQTT connection to the specified broker.
-    pub async fn new(broker: &str) -> Result<Self, paho_mqtt::Error> {
-        info!("Creating new connection object");
-        let client_id_uuid = Uuid::new_v4();
-        let client_id = client_id_uuid.to_string();
-        let create_opts = mqtt::CreateOptionsBuilder::new()
-            .server_uri(broker)
-            .mqtt_version(mqtt::MQTT_VERSION_5)
-            .allow_disconnected_send_at_anytime(true)
-            .client_id(client_id.clone())
-            .finalize();
-        let (tx, rx) = mpsc::channel(32);
-        let client = paho_mqtt::AsyncClient::new(create_opts)?;
-        Ok(Self { 
-            client,
-            client_id,
-            next_subscription_id: 5,
-            subscriptions: Arc::new(Mutex::new(HashMap::new())),
-            pub_chan_rx: rx,
-            pub_chan_tx: tx,
-        })
-    }
-
-    
-    /// Creates a new MQTT connection to the default broker (localhost:1883).
-    pub async fn new_default_connection() -> Result<Self, paho_mqtt::Error> {
-        Connection::new("localhost:1883").await
-    }
-    
-
-    /// Returns the next available subscription ID.
-    fn get_subscription_id(&mut self) -> i32 {
-        let id = self.next_subscription_id;
-        self.next_subscription_id += 1;
-        id
-    }
-
-    /// Returns a message streamer for receiving messages.
-    pub async fn get_streamer(&mut self) -> MessageStreamer {
-        let strm = self.client.get_stream(25);
-        MessageStreamer {
-            subscriptions: self.subscriptions.clone(),
-            strm,
-        }
-    }
-
-    /// Returns a message publisher for sending messages.
-    pub fn get_publisher(&self) -> MessagePublisher {
-        let channel = self.pub_chan_tx.clone();
-        MessagePublisher {
-            channel,
-        }
-    }
-
-    /// Connects to the MQTT broker.
-    pub async fn connect(&self) -> Result<paho_mqtt::ServerResponse, paho_mqtt::Error> {
-        info!("Connecting to mqtt");
-        let conn_opts = mqtt::ConnectOptionsBuilder::new_v5()
-            .keep_alive_interval(Duration::from_secs(20))
-            .clean_start(true)
-            .finalize();
-
-        self.client.connect(conn_opts).await
-    }
-
-    /// Disconnects from the MQTT broker.
-    pub async fn disconnect(&self) -> Result<paho_mqtt::ServerResponse, paho_mqtt::Error> {
-        self.client.disconnect(None).await
-    }
-    
-    /// Publishes a message directly to the MQTT broker.
-    pub async fn publish(&self, msg: mqtt::Message) -> Result<(), paho_mqtt::Error> {
-        info!("Publishing message to {}", msg.topic());
-        let pub_result = self.client.publish(msg).await;
-        pub_result
-    }
-
-    /// Adds a subscription receiver channel for a given subscription ID.
-    async fn add_subscription_receiver(
-        &mut self,
-        subscription_id: i32,
-        tx: Sender<ReceivedMessage>,
-    ) -> Result<(), paho_mqtt::Error> {
-        match self.subscriptions.lock() {
-            Ok(mut subscriptions) => {
-                subscriptions.insert(subscription_id, tx);
-                Ok(())
-            }
-            Err(e) => {
-                error!("Failed to lock subscriptions map: {}", e);
-                Err(paho_mqtt::Error::General("Failed to lock subscriptions map".into()))
-            }
-        }
-    }
-
-    /// Subscribes to a topic and registers a channel for received messages.
-    pub async fn subscribe(&mut self, topic: &str, tx: Sender<ReceivedMessage>) -> Result<i32, paho_mqtt::Error> {
-        info!("Subscribing to {}", topic);
-        let sub_opts = mqtt::SubscribeOptions::new(true, false, mqtt::RetainHandling::SendRetainedOnSubscribe);
-        let mut sub_props = mqtt::Properties::new();
-        let subscription_id = self.get_subscription_id();
-        let si_prop =  mqtt::Property::new(mqtt::PropertyCode::SubscriptionIdentifier, subscription_id as i32)
-            .map_err(|e| {
-                error!("Failed to create subscription property: {:?}", e);
-                paho_mqtt::Error::General("Failed to create subscription property".into())
-            })?;
-        let _ = sub_props.push(si_prop);
-        let sub_result = self.client.subscribe_with_options(topic, paho_mqtt::QOS_1, sub_opts, sub_props).await;
-        if let Err(e) = sub_result {
-            error!("Failed to subscribe to topic {}: {:?}", topic, e);
-            return Err(e);
-        }
-        self.add_subscription_receiver(subscription_id, tx).await?;
-        Ok(subscription_id)
-    }
-
-    /// Starts the main MQTT event loop, handling publishing and receiving.
-    pub async fn start_loop(&mut self) {
-        info!("Starting MQTT loop...");
-
-        let mut streamer = self.get_streamer().await;
-        let _stream_task = tokio::spawn(async move {
-            if let Err(e) = streamer.receive_loop().await {
-                error!("Error in receive loop: {:?}", e);
-            }
-        });
-
-        loop {
-            match self.pub_chan_rx.recv().await {
-                Some(msg) => {
-                    match self.publish(msg).await {
-                        Ok(_r) => info!("Message was published"),
-                        Err(e) => error!("Error publishing: {:?}", e),
-                    }
+                Ok(Event::Outgoing(_)) => {
+                    // Outgoing events don't need special handling
                 }
-                None => {
-                    warn!("Publisher channel closed, breaking loop.");
-                    break;
+                Err(e) => {
+                    error!("Event loop error: {}", e);
+                    return Err(MqttierError::ConnectionError(e));
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_client_creation() {
+        let client = MqttierClient::new("localhost", 1883, None).unwrap();
+        assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn test_client_creation_with_id() {
+        let client_id = "test_client".to_string();
+        let _client = MqttierClient::new("localhost", 1883, Some(client_id)).unwrap();
+        // If we get here without panic, the test passes
     }
 }

@@ -4,19 +4,13 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-futures = "0.3.31"
-paho-mqtt = "0.13.3"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.142"
-tokio = { version = "1", features = ["full"] }
-num-derive = "0.4.2"
-num-traits = "0.2.19"
-log = "0.4.27"
+rumqttc = "0.24"
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+log = "0.4"
+uuid = { version = "1.0", features = ["v4"] }
+thiserror = "1.0"
 
-[dependencies.uuid]
-version = "1.17.0"
-features = [
-    "v4",                # Lets you generate random UUIDs
-    "fast-rng",          # Use a faster (but still sufficiently random) RNG
-    "macro-diagnostics", # Enable better diagnostics for compile-time UUIDs
-]
+[dev-dependencies]
+env_logger = "0.10"
