@@ -173,7 +173,7 @@ impl MqttierClient {
     /// * `topic` - The topic to publish to
     /// * `message` - The message to publish (must be serializable)
     /// * `qos` - The QoS level for the message
-    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS, retain: bool, publish_props: Option<PublishProperties>) -> Result<()> {
+    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS , retain: bool, publish_props: Option<PublishProperties>) -> Result<()> {
         let mut state = self.state.write().await;
         let publish_props = publish_props.unwrap_or_default();
         if state.is_connected {
@@ -192,6 +192,33 @@ impl MqttierClient {
 
         Ok(())
     }
+
+    /// Publish a string message to a topic
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `payload` - The string payload to send
+    /// * `qos` - The QoS level for the message (0, 1, or 2)
+    /// * `retain` - Whether to retain the message
+    /// * `publish_props` - Optional publish properties
+    pub async fn publish_string(
+        &self,
+        topic: String,
+        payload: String,
+        qos: u8,
+        retain: bool,
+        publish_props: Option<PublishProperties>,
+    ) -> Result<()> {
+        let rumqttc_qos = match qos {
+            0 => QoS::AtMostOnce,
+            1 => QoS::AtLeastOnce,
+            2 => QoS::ExactlyOnce,
+            _ => return Err(MqttierError::InvalidQos(qos)),
+        };
+        self.publish(topic, payload.into_bytes(), rumqttc_qos, retain, publish_props).await
+    }
+
     /// Publish a structure message to a topic
     ///
     /// # Arguments
