@@ -27,6 +27,8 @@ pub enum MqttierError {
     SerializationError(#[from] serde_json::Error),
     #[error("Channel send error")]
     ChannelSendError,
+    #[error("Invalid QoS value: {0}")]
+    InvalidQos(u8),
 }
 
 type Result<T> = std::result::Result<T, MqttierError>;
@@ -132,7 +134,7 @@ impl MqttierClient {
     /// # Returns
     /// 
     /// Returns a subscription ID and a receiver for messages on this topic
-    pub async fn subscribe(&self, topic: String, qos: QoS, received_message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<usize> {
+    pub async fn subscribe(&self, topic: String, qos: u8, received_message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<usize> {
         let subscription_id = self.next_subscription_id();
 
         let mut state = self.state.write().await;
@@ -141,14 +143,20 @@ impl MqttierClient {
             id: Some(subscription_id),
             user_properties: Vec::new(),
         };
+        let rumqttc_qos = match qos {
+            0 => QoS::AtMostOnce,
+            1 => QoS::AtLeastOnce,
+            2 => QoS::ExactlyOnce,
+            _ => return Err(MqttierError::InvalidQos(qos)),
+        };
         if state.is_connected {
             debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
-            self.client.subscribe_with_properties(&topic, qos, subscription_props).await?;
+            self.client.subscribe_with_properties(&topic, rumqttc_qos, subscription_props).await?;
         } else {
             debug!("Queueing subscription for topic: {} with QoS: {:?}", topic, qos);
             state.queued_subscriptions.push(QueuedSubscription {
                 topic,
-                qos,
+                qos: rumqttc_qos,
                 props: subscription_props,
             });
         }
