@@ -86,6 +86,7 @@ impl Default for ClientState {
 /// MqttierClient provides an abstracted interface around rumqttc
 #[derive(Clone)]
 pub struct MqttierClient {
+    pub client_id: String,
     client: AsyncClient,
     state: Arc<RwLock<ClientState>>,
     next_subscription_id: Arc<AtomicUsize>,
@@ -104,13 +105,14 @@ impl MqttierClient {
     pub fn new(hostname: &str, port: u16, client_id: Option<String>) -> Result<Self> {
         let client_id = client_id.unwrap_or_else(|| Uuid::new_v4().to_string());
         
-        let mut mqttoptions = MqttOptions::new(client_id, hostname, port);
+        let mut mqttoptions = MqttOptions::new(client_id.clone(), hostname, port);
         mqttoptions.set_keep_alive(Duration::from_secs(60));
         mqttoptions.set_clean_start(true);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
         Ok(Self {
+            client_id,
             client,
             state: Arc::new(RwLock::new(ClientState::default())),
             next_subscription_id: Arc::new(AtomicUsize::new(5)),
