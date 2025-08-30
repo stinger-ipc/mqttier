@@ -54,7 +54,7 @@ struct QueuedMessage {
 pub struct ReceivedMessage {
     pub topic: String,
     pub payload: Vec<u8>,
-    pub qos: QoS,
+    pub qos: u8,
     pub subscription_id: usize,
     pub response_topic: Option<String>,
     pub content_type: Option<String>,
@@ -359,7 +359,11 @@ impl MqttierClient {
                             let message = ReceivedMessage {
                                 topic: topic_str.clone(),
                                 payload: publish.payload.to_vec(),
-                                qos: publish.qos,
+                                qos: match publish.qos {
+                                    QoS::AtMostOnce => 0,
+                                    QoS::AtLeastOnce => 1,
+                                    QoS::ExactlyOnce => 2,
+                                },
                                 subscription_id: subscription_id,
                                 response_topic: response_topic.clone(),
                                 correlation_data: correlation_data.clone().map(|data| data.to_vec()),
