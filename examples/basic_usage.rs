@@ -1,5 +1,4 @@
 use mqttier::{MqttierClient, ReceivedMessage};
-use rumqttc::v5::mqttbytes::QoS;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -27,10 +26,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     sleep(Duration::from_secs(2)).await;
 
     // Create mpsc channel for receiving messages
-    let (message_tx, mut message_rx) = mpsc::unbounded_channel::<ReceivedMessage>();
+    let (message_tx, mut message_rx) = mpsc::channel::<ReceivedMessage>(64);
 
     // Subscribe to a topic
-    let subscription_id = client.subscribe("test/topic".to_string(), QoS::AtMostOnce, message_tx).await?;
+    let subscription_id = client.subscribe("test/topic".to_string(), 0, message_tx).await?;
     println!("Subscribed to 'test/topic' with ID: {}", subscription_id);
 
     // Start a task to handle incoming messages

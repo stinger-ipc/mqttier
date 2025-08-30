@@ -67,7 +67,7 @@ pub struct ReceivedMessage {
 #[derive(Debug)]
 struct ClientState {
     is_connected: bool,
-    subscriptions: HashMap<usize, mpsc::UnboundedSender<ReceivedMessage>>,
+    subscriptions: HashMap<usize, mpsc::Sender<ReceivedMessage>>,
     queued_subscriptions: Vec<QueuedSubscription>,
     queued_messages: Vec<QueuedMessage>,
 }
@@ -136,7 +136,7 @@ impl MqttierClient {
     /// # Returns
     /// 
     /// Returns a subscription ID and a receiver for messages on this topic
-    pub async fn subscribe(&self, topic: String, qos: u8, received_message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<usize> {
+    pub async fn subscribe(&self, topic: String, qos: u8, received_message_tx: mpsc::Sender<ReceivedMessage>) -> Result<usize> {
         let subscription_id = self.next_subscription_id();
 
         let mut state = self.state.write().await;
@@ -408,7 +408,7 @@ impl MqttierClient {
                             };
                             let state_guard = state.read().await;
                             if let Some(sender) = state_guard.subscriptions.get(&subscription_id) {
-                                if let Err(_) = sender.send(message.clone()) {
+                                if let Err(_) = sender.send(message.clone()).await {
                                     warn!("Failed to send message to subscription {}", subscription_id);
                                 }
                             }

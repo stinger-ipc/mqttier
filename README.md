@@ -35,11 +35,11 @@ let client = MqttierClient::new("localhost", 1883, Some("mqttier_example".to_str
 client.run_loop().await;
 
 // Create mpsc channel for receiving messages
-let (message_tx, mut message_rx) = mpsc::unbounded_channel::<ReceivedMessage>();
+let (message_tx, mut message_rx) = mpsc::channel::<ReceivedMessage>(64);
 
 // Subscribe to a topic.  We pass in the tx-side of the channel that we want to be used
 // when a message is received for a subscription.  
-let subscription_id = client.subscribe("test/topic".to_string(), QoS::AtMostOnce, message_tx).await;
+let subscription_id = client.subscribe("test/topic".to_string(), 0, message_tx).await;
 
 // Start a task to handle incoming messages
 tokio::spawn(async move {
@@ -71,13 +71,13 @@ Creates a new MQTT client.
 
 Starts the connection loop. This should be called once per client. If already running, this method does nothing.
 
-#### `subscribe(topic: String, qos: QoS, message_tx: mpsc::UnboundedSender<ReceivedMessage>) -> Result<u64>`
+#### `subscribe(topic: String, qos: u8, message_tx: mpsc::Sender<ReceivedMessage>) -> Result<u64>`
 
 Subscribes to a topic and returns a subscription ID.
 
 - `topic`: The MQTT topic to subscribe to
-- `qos`: The Quality of Service level
-- `message_tx`: The sender channel for delivering received messages
+- `qos`: The Quality of Service level (0, 1, or 2)
+- `message_tx`: The sender channel for delivering received messages (bounded channel with capacity 64)
 - Returns: The subscription ID (`u64`)
 
 
