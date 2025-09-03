@@ -1,5 +1,6 @@
 use mqttier::{MqttierClient, ReceivedMessage};
 use serde::{Deserialize, Serialize};
+use std::fmt::format;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -45,21 +46,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // Publish some test messages
-    for i in 0..5 {
-        let test_message = TestMessage {
-            id: i,
-            content: format!("Hello, MQTT! Message #{}", i),
-            timestamp: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        };
+    let client2 = client.clone();
+    tokio::spawn(async move {
+        for i in 0..10 {
+            let test_message = TestMessage {
+                id: i,
+                content: format!("Hello, MQTT! Message #{}", i),
+                timestamp: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
+            };
 
-        client.publish_structure("test/topic".to_string(), &test_message).await?;
-        println!("Published message #{}", i);
+            let _ = client2.publish_structure("test/topic".to_string(), &test_message).await;
+            println!("Published message #{}", i);
 
-        sleep(Duration::from_secs(1)).await;
-    }
+            sleep(Duration::from_secs(1)).await;
+        }
+    });
+
+    // Publish some test messages
+    let client3 = client.clone();
+    tokio::spawn(async move {
+        for i in 0..5 {
+            let _ = client3.publish_string("test/hello".to_string(), format!("Hello World {}", i), 1, true, None).await;
+            println!("Published hello message #{}", i);
+
+            sleep(Duration::from_secs(2)).await;
+        }
+    });
+
+    let client4 = client.clone();
+    tokio::spawn(async move {
+        for i in 10..15 {
+            let _ = client4.publish_state("test/state".to_string(), vec![i; 10], 1).await;
+            println!("Published state message #{}", i);
+        }
+        sleep(Duration::from_secs(3)).await;
+    });
 
     // Keep the program running for a bit to see the messages
     sleep(Duration::from_secs(10)).await;
