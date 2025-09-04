@@ -283,7 +283,7 @@ impl MqttierClient {
     /// Publish a state message to a topic
     ///
     /// # Arguments
-    ///
+    /// 
     /// * `topic` - The topic to publish to
     /// * `payload` - The serializable struct to send as payload
     pub async fn publish_state<T: Serialize>(
@@ -361,28 +361,40 @@ impl MqttierClient {
         state: &Arc<RwLock<ClientState>>,
     ) -> Result<()> {
         loop {
+            debug!("Event loop polled");
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                    info!("Connected to MQTT broker");
-                    
-                    let mut state_guard = state.write().await;
-                    state_guard.is_connected = true;
+                    info!("CONNACK: Connected to MQTT broker");
+
+                    {
+                        let mut state_guard = state.write().await;
+                        state_guard.is_connected = true;
+                    }
 
                     // Process queued subscriptions
-                    for subscription in state_guard.queued_subscriptions.drain(..) {
-                        debug!("Processing queued subscription for topic: {}", subscription.topic);
-                        if let Err(e) = client.subscribe_with_properties(&subscription.topic, subscription.qos, subscription.props).await {
-                            error!("Failed to subscribe to {}: {}", subscription.topic, e);
+                    let s = state.clone();
+                    let c = client.clone();
+                    tokio::spawn(async move {
+                        let mut state_guard = s.write().await;
+                        for subscription in state_guard.queued_subscriptions.drain(..) {
+                            debug!("Processing queued subscription for topic: {}", subscription.topic);
+                            if let Err(e) = c.subscribe_with_properties(&subscription.topic, subscription.qos, subscription.props).await {
+                                error!("Failed to subscribe to {}: {}", subscription.topic, e);
+                            }
                         }
-                    }
+                    });
 
                     // Process queued messages
-                    for message in state_guard.queued_messages.drain(..) {
-                        debug!("Processing queued message for topic: {}", message.topic);
-                        if let Err(e) = client.publish_with_properties(&message.topic, message.qos, message.retain, message.payload, message.publish_props).await {
-                            error!("Failed to publish to {}: {}", message.topic, e);
+                    let s = state.clone();
+                    let c = client.clone();
+                    tokio::spawn(async move {
+                        let mut state_guard = s.write().await;
+                        for message in state_guard.queued_messages.drain(..) {
+                            debug!("Processing queued message for topic: {}", message.topic);
+                            let x = c.publish_with_properties(&message.topic, message.qos, message.retain, message.payload, message.publish_props).await;
+                            info!("Publish result {}: {:?}", message.topic, x);
                         }
-                    }
+                    });
                 }
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     let topic_str = String::from_utf8_lossy(&publish.topic).to_string();

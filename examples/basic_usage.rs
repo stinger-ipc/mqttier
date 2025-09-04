@@ -18,19 +18,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
 
     // Create a new MQTT client
-    let client = MqttierClient::new("localhost", 1883, Some("mqttier_example".to_string()))?;
-
-    // Start the run loop
-    client.run_loop().await?;
-
-    // Wait a bit for connection
-    sleep(Duration::from_secs(2)).await;
+    let client = MqttierClient::new("localhost", 1883, Some("mqttc".to_string()))?;
 
     // Create mpsc channel for receiving messages
     let (message_tx, mut message_rx) = mpsc::channel::<ReceivedMessage>(64);
 
     // Subscribe to a topic
-    let subscription_id = client.subscribe("test/topic".to_string(), 0, message_tx).await?;
+    let subscription_id = client.subscribe("test/command".to_string(), 0, message_tx).await?;
     println!("Subscribed to 'test/topic' with ID: {}", subscription_id);
 
     // Start a task to handle incoming messages
@@ -45,20 +39,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // Publish some test messages
+    let client1 = client.clone();
+    let pub_task = tokio::spawn(async move {
+        for i in 0..6 {
+            let _ = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await;
+            println!("Published message #{}", i);
+
+            sleep(Duration::from_secs(3)).await;
+        }
+    });
+
     let client2 = client.clone();
-    tokio::spawn(async move {
-        for i in 0..10 {
+    let pub_task2 = tokio::spawn(async move {
+        for i in 10..13 {
             let test_message = TestMessage {
                 id: i,
-                content: format!("Hello, MQTT! Message #{}", i),
+                content: format!("Hello from another task #{}", i),
                 timestamp: std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
                     .as_secs(),
             };
 
-            let _ = client2.publish_structure("test/topic".to_string(), &test_message).await;
+            let _ = client2.publish_structure("test/structure".to_string(), &test_message).await;
             println!("Published message #{}", i);
 
             sleep(Duration::from_secs(1)).await;
@@ -85,8 +88,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         sleep(Duration::from_secs(3)).await;
     });
 
+    sleep(Duration::from_secs(5)).await;
+
+    // Start the MQTT client loop
+    println!("Starting MQTT client loop...");
+    client.run_loop().await?;
+
     // Keep the program running for a bit to see the messages
-    sleep(Duration::from_secs(10)).await;
+    sleep(Duration::from_secs(15)).await;
+
+    pub_task.await?;
+    pub_task2.await?;
 
     Ok(())
 }
