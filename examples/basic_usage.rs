@@ -1,6 +1,5 @@
 use mqttier::{MqttierClient, ReceivedMessage};
 use serde::{Deserialize, Serialize};
-use std::fmt::format;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -14,8 +13,10 @@ struct TestMessage {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    env_logger::init();
+    // Initialize logging to stdout
+    env_logger::Builder::from_default_env()
+        .target(env_logger::Target::Stdout)
+        .init();
 
     // Create a new MQTT client
     let client = MqttierClient::new("localhost", 1883, Some("mqttc".to_string()))?;
@@ -84,8 +85,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         for i in 10..15 {
             let _ = client4.publish_state("test/state".to_string(), vec![i; 10], 1).await;
             println!("Published state message #{}", i);
+            sleep(Duration::from_secs(3)).await;
         }
-        sleep(Duration::from_secs(3)).await;
     });
 
     sleep(Duration::from_secs(5)).await;

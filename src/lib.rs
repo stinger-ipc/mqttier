@@ -300,7 +300,7 @@ impl MqttierClient {
         props.content_type = Some("application/json".to_string());
         let payload_bytes = serde_json::to_vec(&payload)?;
         info!("Publishing state to topic: {} with version: {}", topic, state_version);
-        self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, None).await
+        self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props)).await
     }
 
     /// Start the run loop for handling MQTT connections and messages
