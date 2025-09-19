@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{debug, error, info, warn};
+use tracing::{debug, error, info, warn};
 use rumqttc::v5::{MqttOptions, AsyncClient, EventLoop, Event};
 use rumqttc::v5::mqttbytes::v5::{PublishProperties, SubscribeProperties, Packet};
 use rumqttc::v5::mqttbytes::{QoS};

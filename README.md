@@ -128,10 +128,13 @@ When disconnected:
 
 ### Logging
 
-The library uses the `log` crate. Initialize logging in your application:
+The library uses the `tracing` crate. Initialize logging in your application:
 
 ```rust
-env_logger::init();
+tracing_subscriber::fmt()
+    .with_writer(std::io::stdout)
+    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+    .init();
 ```
 
 ## Example

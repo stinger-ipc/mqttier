@@ -13,9 +13,10 @@ struct TestMessage {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging to stdout
-    env_logger::Builder::from_default_env()
-        .target(env_logger::Target::Stdout)
+    // Initialize tracing to stdout
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stdout)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     // Create a new MQTT client
