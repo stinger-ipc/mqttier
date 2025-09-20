@@ -44,8 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client1 = client.clone();
     let pub_task = tokio::spawn(async move {
         for i in 0..6 {
-            let _ = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await;
+            let publish_rx = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await.unwrap();
             println!("Published message #{}", i);
+            
+            // Wait for acknowledgment
+            match publish_rx.await {
+                Ok(Ok(result)) => println!("Message #{} acknowledged: {:?}", i, result),
+                Ok(Err(e)) => println!("Message #{} failed: {:?}", i, e),
+                Err(_) => println!("Message #{} completion channel closed", i),
+            }
 
             sleep(Duration::from_secs(3)).await;
         }
@@ -63,8 +70,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_secs(),
             };
 
-            let _ = client2.publish_structure("test/structure".to_string(), &test_message).await;
-            println!("Published message #{}", i);
+            let publish_rx = client2.publish_structure("test/structure".to_string(), &test_message).await.unwrap();
+            println!("Published structure message #{}", i);
+            
+            // Wait for acknowledgment
+            match publish_rx.await {
+                Ok(Ok(result)) => println!("Structure message #{} acknowledged: {:?}", i, result),
+                Ok(Err(e)) => println!("Structure message #{} failed: {:?}", i, e),
+                Err(_) => println!("Structure message #{} completion channel closed", i),
+            }
 
             sleep(Duration::from_secs(1)).await;
         }
