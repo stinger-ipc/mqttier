@@ -1,6 +1,6 @@
 [package]
 name = "mqttier"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
@@ -8,10 +8,11 @@ rumqttc = "0.24"
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+log = "0.4"
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 thiserror = "1.0"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+env_logger = "0.10"
 
 [dev-dependencies]
-
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

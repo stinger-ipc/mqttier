@@ -33,17 +33,24 @@ pub enum MqttierError {
 
 type Result<T> = std::result::Result<T, MqttierError>;
 
-/// Result of a publish operation indicating when message was acknowledged by broker
+/// Result of a publish operation indicating when the message lifecycle completed.
+///
+/// Variants:
+/// - `Acknowledged(pkid)` - QoS 1: broker acknowledged the publish (PUBACK)
+/// - `Completed(pkid)` - QoS 2: publish flow completed (PUBCOMP)
+/// - `Sent(pkid)` - QoS 0: message was sent but no broker ack expected
+/// - `TimedOut` - waiting for the send packet id timed out
+/// - `Error(..)` - internal or channel errors
 #[derive(Debug)]
 pub enum PublishResult {
     /// Message was acknowledged by broker (QoS 1 PUBACK)
-    Acknowledged(i32),
+    Acknowledged(u16),
 
     /// Message transmission to broker was completed (QoS 2 PUBCOMP)
-    Completed(i32),
+    Completed(u16),
 
     /// No acknowledgment expected (QoS 0)
-    Sent(i32),
+    Sent(u16),
 
     /// Timed Out
     TimedOut,
@@ -59,7 +66,7 @@ type PublishCompletion = oneshot::Sender<PublishResult>;
 #[derive(Debug)]
 struct PendingPublish {
     qos: QoS,
-    completion: Option<PublishCompletion>,
+    completion: PublishCompletion,
 }
 
 /// Represents a queued subscription
@@ -78,10 +85,13 @@ struct QueuedMessage {
     qos: QoS,
     retain: bool,
     publish_props: PublishProperties,
-    completion: PublishCompletion,
+    completion: Option<PublishCompletion>,
 }
 
-/// A message received from a subscription
+/// A message received from a subscription.
+///
+/// This is delivered to subscribers via the `mpsc::Sender<ReceivedMessage>` registered
+/// when calling `MqttierClient::subscribe`.
 #[derive(Debug, Clone)]
 pub struct ReceivedMessage {
     pub topic: String,
@@ -91,6 +101,8 @@ pub struct ReceivedMessage {
     pub response_topic: Option<String>,
     pub content_type: Option<String>,
     pub correlation_data: Option<Vec<u8>>,
+    /// User properties from the MQTT5 publish properties. Keys and values are strings.
+    pub user_properties: HashMap<String, String>,
 }
 
 /// Internal state of the MqttierClient
@@ -99,25 +111,28 @@ struct ClientState {
     is_connected: bool,
     subscriptions: HashMap<usize, mpsc::Sender<ReceivedMessage>>,
     queued_subscriptions: Vec<QueuedSubscription>,
-    publish_queue_rx: Option<mpsc::Receiver<QueuedMessage>>, /// All publishes from the client must be run through this queue.
-    sent_queue_tx: Option<mpsc::Sender<i32>>, /// When the event loop shows an outgoing publish, we send the packet id through this channel to mark it as sent.
-    pending_publishes: HashMap<i32, PendingPublish>, /// This is a map to PendingPublish structs keyed by packet id.  When we get an PUBACK or PUBCOMP, we look up the packet id here to find the completion channel to notify.
+    /// This is a map to PendingPublish structs keyed by packet ID. When we get an PUBACK or PUBCOMP, we look up the packet ID here to find the completion channel to notify.
+    pending_publishes: Arc<Mutex<HashMap<u16, PendingPublish>>>,
 }
 
-impl Default for ClientState {
-    fn default() -> Self {
-        Self {
-            is_connected: false,
-            subscriptions: HashMap::new(),
-            queued_subscriptions: Vec::new(),
-            publish_queue_rx: None,
-            sent_queue_tx: None,
-            pending_publishes: HashMap::new(),
-        }
-    }
+struct PublishState {
+    /// Receiver for messages that need to be sent.
+    publish_queue_rx: mpsc::Receiver<QueuedMessage>,
+
+    /// Receiver for packet IDs of messages that have been sent.
+    sent_queue_rx: mpsc::Receiver<u16>,
+
+    pending_publishes: Arc<Mutex<HashMap<u16, PendingPublish>>>,
 }
 
-/// MqttierClient provides an abstracted interface around rumqttc
+/// MqttierClient provides an abstracted, cloneable interface around `rumqttc`.
+///
+/// Usage contract:
+/// - Construct with `MqttierClient::new(...)`.
+/// - Call `run_loop().await` once per client to start background tasks.
+/// - Use `subscribe(...)` to register a subscription and a channel sender for messages.
+/// - Use `publish*` helpers to publish data; they return a oneshot receiver that will be
+///   resolved when the publish completes (or timed out / error).
 #[derive(Clone)]
 pub struct MqttierClient {
     pub client_id: String,
@@ -126,10 +141,19 @@ pub struct MqttierClient {
     next_subscription_id: Arc<AtomicUsize>,
     is_running: Arc<Mutex<bool>>,
     eventloop: Arc<Mutex<Option<EventLoop>>>,
+
+    // All publishes from the client must be run through this queue.
+    publish_queue_tx: mpsc::Sender<QueuedMessage>,
+
+    /// Sender to indicate messages by packet ID which have been sent.
+    sent_queue_tx: mpsc::Sender<u16>,
+
+    /// Shared publish-related state (pending publishes, sent queue receiver, etc.)
+    publish_state: Arc<Mutex<PublishState>>,
 }
 
 impl MqttierClient {
-    /// Create a new MqttierClient
+    /// Create a new `MqttierClient`.
     /// 
     /// # Arguments
     /// 
@@ -144,32 +168,53 @@ impl MqttierClient {
         mqttoptions.set_clean_start(true);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+        
+        // Create the sent queue channels (u16 packet ids)
+        let (sent_queue_tx, sent_queue_rx) = mpsc::channel::<u16>(5);
+        let (publish_queue_tx, publish_queue_rx) = mpsc::channel::<QueuedMessage>(100);
+
+        let initial_publish_state = PublishState {
+            publish_queue_rx,
+            sent_queue_rx,
+            pending_publishes: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        let initial_state = ClientState {
+            is_connected: false,
+            subscriptions: HashMap::new(),
+            queued_subscriptions: Vec::new(),
+            pending_publishes: initial_publish_state.pending_publishes.clone(),
+        };
 
         Ok(Self {
             client_id,
             client,
-            state: Arc::new(RwLock::new(ClientState::default())),
+            state: Arc::new(RwLock::new(initial_state)),
             next_subscription_id: Arc::new(AtomicUsize::new(5)),
             is_running: Arc::new(Mutex::new(false)),
             eventloop: Arc::new(Mutex::new(Some(eventloop))),
+            publish_queue_tx,
+            sent_queue_tx,
+            publish_state: Arc::new(Mutex::new(initial_publish_state)),
         })
     }
 
-    /// Get the next subscription id value
+    /// Get the next subscription id value (internal).
     fn next_subscription_id(&self) -> usize {
         self.next_subscription_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Subscribe to a topic
+    /// Subscribe to a topic.
     /// 
     /// # Arguments
     /// 
-    /// * `topic` - The topic to subscribe to
-    /// * `qos` - The QoS level for the subscription
-    /// 
-    /// # Returns
-    /// 
-    /// Returns a subscription ID and a receiver for messages on this topic
+    ///
+    /// Arguments:
+    /// - `topic`: topic to subscribe to
+    /// - `qos`: QoS level (0, 1, 2)
+    /// - `received_message_tx`: mpsc Sender that will receive `ReceivedMessage`s for this subscription
+    ///
+    /// Returns: subscription id (usize) on success.
     pub async fn subscribe(&self, topic: String, qos: u8, received_message_tx: mpsc::Sender<ReceivedMessage>) -> Result<usize> {
         let subscription_id = self.next_subscription_id();
 
@@ -200,45 +245,52 @@ impl MqttierClient {
         Ok(subscription_id)
     }
 
-    /// Publish a message to a topic
+    /// Publish a raw payload to a topic.
     /// 
     /// # Arguments
     /// 
     /// * `topic` - The topic to publish to
-    /// * `message` - The message to publish (must be serializable)
-    /// * `qos` - The QoS level for the message
-    /// 
-    /// # Returns
-    /// 
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker
-    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS , retain: bool, publish_props: Option<PublishProperties>) -> Result<oneshot::Receiver<Result<PublishResult>>> {
-        let mut state = self.state.write().await;
+    ///
+    /// Arguments:
+    /// - `topic`: topic to publish to
+    /// - `payload`: raw payload bytes
+    /// - `qos`: QoS (use `rumqttc::v5::mqttbytes::QoS` variants)
+    /// - `retain`: whether to set the retain flag
+    /// - `publish_props`: optional MQTT5 publish properties
+    ///
+    /// Returns: a `oneshot::Receiver<PublishResult>` that will resolve when the publish
+    /// completes or errors.
+    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS , retain: bool, publish_props: Option<PublishProperties>) -> Result<oneshot::Receiver<PublishResult>> {
+        let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
         let publish_props = publish_props.unwrap_or_default();
         let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
 
-        // If we have a publish queue, send through that
-        if let Some(ref publish_queue_tx) = state.publish_queue_tx {
-            debug!("Sending message to publish queue for topic: {} with QoS: {:?}", topic, qos);
-            let message = QueuedMessage {
-                topic,
-                payload,
-                qos,
-                retain,
-                publish_props,
-                completion: completion_tx,
-            };
-            if let Err(_) = publish_queue_tx.send(message).await {
-                completion_tx.send(PublishResult::Error("Failed to send message to publish queue".to_string()));
-                return Err(MqttierError::ChannelSendError);
+        // If we have a publish queue, send through that.
+        debug!("Sending message to publish queue for topic: {} with QoS: {:?}", topic, qos);
+        let message = QueuedMessage {
+            topic,
+            payload,
+            qos,
+            retain,
+            publish_props,
+            completion: Some(completion_tx),
+        };
+        match self.publish_queue_tx.send(message).await {
+            Ok(_) => {}
+            Err(e) => {
+                // On error we get the message back so we can notify the original completion sender
+                let mut returned = e.0;
+                if let Some(sender) = returned.completion.take() {
+                    let _ = sender.send(PublishResult::Error("Channel send error".to_string()));
+                }
             }
-        } else {
-            error!("No publish queue available.  Not sending message");
         }
+
 
         Ok(completion_rx)
     }
 
-    /// Publish a string message to a topic
+    /// Publish a UTF-8 string payload to a topic.
     ///
     /// # Arguments
     ///
@@ -258,7 +310,7 @@ impl MqttierClient {
         qos: u8,
         retain: bool,
         publish_props: Option<PublishProperties>,
-    ) -> Result<oneshot::Receiver<Result<PublishResult>>> {
+    ) -> Result<oneshot::Receiver<PublishResult>> {
         let rumqttc_qos = match qos {
             0 => QoS::AtMostOnce,
             1 => QoS::AtLeastOnce,
@@ -268,7 +320,7 @@ impl MqttierClient {
         self.publish(topic, payload.into_bytes(), rumqttc_qos, retain, publish_props).await
     }
 
-    /// Publish a structure message to a topic
+    /// Publish a serializable struct as JSON to a topic (QoS 2 by default in helper).
     ///
     /// # Arguments
     ///
@@ -283,14 +335,14 @@ impl MqttierClient {
         &self,
         topic: String,
         payload: T,
-    ) -> Result<oneshot::Receiver<Result<PublishResult>>> {
+    ) -> Result<oneshot::Receiver<PublishResult>> {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
         let payload_bytes = serde_json::to_vec(&payload)?;
         self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
     }
 
-    /// Publish a request message to a topic with response topic and correlation id
+    /// Publish a request message to a topic with response topic and correlation id.
     ///
     /// # Arguments
     ///
@@ -308,7 +360,7 @@ impl MqttierClient {
         payload: T,
         response_topic: String,
         correlation_id: Vec<u8>,
-    ) -> Result<oneshot::Receiver<Result<PublishResult>>> {
+    ) -> Result<oneshot::Receiver<PublishResult>> {
         let mut props = PublishProperties::default();
         props.response_topic = Some(response_topic);
         props.correlation_data = Some(correlation_id.into());
@@ -317,7 +369,7 @@ impl MqttierClient {
         self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
     }
 
-    /// Publish a response message to a topic with correlation id
+    /// Publish a response message to a topic with correlation id.
     ///
     /// # Arguments
     ///
@@ -333,7 +385,7 @@ impl MqttierClient {
         topic: String,
         payload: T,
         correlation_id: Vec<u8>,
-    ) -> Result<oneshot::Receiver<Result<PublishResult>>> {
+    ) -> Result<oneshot::Receiver<PublishResult>> {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
         props.correlation_data = Some(correlation_id.into());
@@ -341,7 +393,7 @@ impl MqttierClient {
         self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
     }
 
-    /// Publish a state message to a topic
+    /// Publish a state message to a topic. Adds a user property `PropertyVersion` to the message properties.
     ///
     /// # Arguments
     /// 
@@ -356,7 +408,7 @@ impl MqttierClient {
         topic: String,
         payload: T,
         state_version: u32,
-    ) -> Result<oneshot::Receiver<Result<PublishResult>>> {
+    ) -> Result<oneshot::Receiver<PublishResult>> {
         let mut props = PublishProperties::default();
         props.user_properties.push((
             "PropertyVersion".to_string(),
@@ -378,24 +430,17 @@ impl MqttierClient {
         *is_running = true;
         drop(is_running);
 
-        // Create publish queue
-        let (publish_queue_tx, publish_queue_rx) = mpsc::channel::<QueuedMessage>(100);
-
-        // Set up the channels in state
-        {
-            let mut state = self.state.write().await;
-            state.publish_queue_tx = Some(publish_queue_tx);
-        }
-
         let client = self.client.clone();
         let state = self.state.clone();
         let eventloop = self.eventloop.clone();
+        let publish_state = self.publish_state.clone();
+        let sent_queue_tx = self.sent_queue_tx.clone();
 
         // Start the publish loop
         let client_for_publish = client.clone();
         let state_for_publish = state.clone();
         tokio::spawn(async move {
-            Self::publish_loop(client_for_publish, state_for_publish, publish_queue_rx).await;
+            Self::publish_loop(client_for_publish, state_for_publish, publish_state).await;
         });
 
         // Start the connection loop
@@ -408,7 +453,7 @@ impl MqttierClient {
                 if let Some(mut el) = eventloop_guard.take() {
                     drop(eventloop_guard);
                     
-                    match Self::handle_connection(&client, &mut el, &state, ack_packet_tx.clone()).await {
+                    match Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone()).await {
                         Ok(_) => {
                             info!("MQTT connection loop ended normally");
                         }
@@ -440,11 +485,13 @@ impl MqttierClient {
     async fn publish_loop(
         client: AsyncClient,
         state: Arc<RwLock<ClientState>>,
-        mut publish_queue_rx: mpsc::Receiver<QueuedMessage>,
+        publish_state: Arc<Mutex<PublishState>>,
     ) {
         info!("Starting publish loop");
+        // This should be the only publish loop, so we can lock the publish state here.
+        let mut pub_state = publish_state.lock().await;
 
-        while let Some(message) = publish_queue_rx.recv().await {
+    while let Some(mut message) = pub_state.publish_queue_rx.recv().await {
             debug!("Processing queued message for topic: {}", message.topic);
             let publish_result: std::result::Result<(), rumqttc::v5::ClientError> = client.publish_with_properties(
                 &message.topic,
@@ -459,41 +506,59 @@ impl MqttierClient {
                     debug!("Published queued message for topic: {}", message.topic);
 
                     // After a successful publish call, wait for the sent packet id from the sent queue receiver
-                    let mut state_guard = state.write().await;
-                    if let Some(ref mut sent_rx) = state_guard.sent_queue_rx {
-                        match sent_rx.recv().await {
-                            Some(packet_id) => {
-                                debug!("Received sent packet id {} for topic: {}", packet_id, message.topic);
-                                // Ensure the client is connected before registering the pending publish so we can correlate acks.
-                                drop(state_guard);
-                                loop {
-                                    let state_read = state.read().await;
-                                    if state_read.is_connected {
-                                        break;
-                                    }
-                                    drop(state_read);
-                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    match tokio::time::timeout(Duration::from_secs(5), pub_state.sent_queue_rx.recv()).await {
+                        Ok(Some(packet_id)) => {
+                            debug!("Received sent packet id {} for topic: {}", packet_id, message.topic);
+                            // Ensure the client is connected before registering the pending publish so we can correlate acks.
+                            loop {
+                                let state_read = state.read().await;
+                                if state_read.is_connected {
+                                    break;
                                 }
-
-                                let mut state_guard = state.write().await;
-                                state_guard.pending_publishes.insert(packet_id, PendingPublish {
-                                    qos: message.qos,
-                                    completion: Some(message.completion),
-                                });
+                                drop(state_read);
+                                tokio::time::sleep(Duration::from_millis(100)).await;
                             }
-                            None => {
-                                error!("sent_queue_rx closed unexpectedly; cannot correlate published message for topic: {}", message.topic);
-                                let _ = message.completion.send(PublishResult::Error("sent_queue receiver closed".to_string()));
+
+                            // If QoS is 0, immediately notify completion and continue without inserting into pending_publishes
+                            if message.qos == QoS::AtMostOnce {
+                                if let Some(sender) = message.completion.take() {
+                                    let _ = sender.send(PublishResult::Sent(packet_id));
+                                }
+                                continue;
+                            }
+
+                            if let Some(sender) = message.completion.take() {
+                                let mut pp_map_guard = pub_state.pending_publishes.lock().await;
+                                pp_map_guard.insert(packet_id, PendingPublish {
+                                    qos: message.qos,
+                                    completion: sender,
+                                });
+                            } else {
+                                error!("No completion channel provided for published message on topic: {}", message.topic);
                             }
                         }
-                    } else {
-                        error!("No sent_queue_rx available to receive packet id for topic: {}", message.topic);
-                        let _ = message.completion.send(PublishResult::Error("no sent_queue receiver available".to_string()));
+                        Ok(None) => {
+                            // sent_queue receiver closed unexpectedly
+                            error!("sent_queue_rx closed unexpectedly; cannot correlate published message for topic: {}", message.topic);
+                            if let Some(sender) = message.completion.take() {
+                                let _ = sender.send(PublishResult::Error("sent_queue receiver closed".to_string()));
+                            }
+                        }
+                        Err(_) => {
+                            // Timeout waiting for sent packet id
+                            warn!("Timed out waiting for sent packet id for topic: {}", message.topic);
+                            if let Some(sender) = message.completion.take() {
+                                let _ = sender.send(PublishResult::TimedOut);
+                            }
+                            continue;
+                        }
                     }
                 }
                 Err(e) => {
                     error!("Failed to publish message to {}: {}", message.topic, e);
-                    let _ = message.completion.send(PublishResult::Error(format!("{}", e)));
+                    if let Some(sender) = message.completion.take() {
+                        let _ = sender.send(PublishResult::Error(format!("{}", e)));
+                    }
                 }
             }
         }
@@ -504,8 +569,9 @@ impl MqttierClient {
         client: &AsyncClient,
         eventloop: &mut EventLoop,
         state: &Arc<RwLock<ClientState>>,
-        ack_packet_tx: mpsc::Sender<rumqttc::v5::mqttbytes::v5::Packet>,
+        sent_queue_tx: mpsc::Sender<u16>,
     ) -> Result<()> {
+
         loop {
             debug!("Event loop polled");
             match eventloop.poll().await {
@@ -541,6 +607,12 @@ impl MqttierClient {
                         let response_topic = pub_props.response_topic;
                         let content_type = pub_props.content_type;
                         for subscription_id in subscription_ids {
+                            // Collect user properties into a HashMap (last value wins for duplicate keys)
+                            let mut user_props_map: HashMap<String, String> = HashMap::new();
+                            for (k, v) in pub_props.user_properties.iter() {
+                                user_props_map.insert(k.clone(), v.clone());
+                            }
+
                             let message = ReceivedMessage {
                                 topic: topic_str.clone(),
                                 payload: publish.payload.to_vec(),
@@ -553,6 +625,7 @@ impl MqttierClient {
                                 response_topic: response_topic.clone(),
                                 correlation_data: correlation_data.clone().map(|data| data.to_vec()),
                                 content_type: content_type.clone(),
+                                user_properties: user_props_map,
                             };
                             let state_guard = state.read().await;
                             if let Some(sender) = state_guard.subscriptions.get(&subscription_id) {
@@ -565,17 +638,16 @@ impl MqttierClient {
                 }
                 Ok(Event::Incoming(Packet::PubAck(puback))) => {
                     debug!("Received PUBACK for packet ID: {}", puback.pkid);
-                    let pkid_i32 = puback.pkid as i32;
+                    let pkid_u16 = puback.pkid;
 
                     // If we have a pending publish for this packet id and it was QoS 1, notify completion as Acknowledged.
                     {
-                        let mut state_guard = state.write().await;
-                        if let Some(existing) = state_guard.pending_publishes.get(&pkid_i32) {
+                        let pending_arc = state.read().await.pending_publishes.clone();
+                        let mut pending_map = pending_arc.lock().await;
+                        if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::AtLeastOnce {
-                                if let Some(pending) = state_guard.pending_publishes.remove(&pkid_i32) {
-                                    if let Some(completion) = pending.completion {
-                                        let _ = completion.send(PublishResult::Acknowledged(pkid_i32));
-                                    }
+                                if let Some(pending) = pending_map.remove(&pkid_u16) {
+                                    let _ = pending.completion.send(PublishResult::Acknowledged(pkid_u16));
                                 }
                             }
                         }
@@ -583,18 +655,15 @@ impl MqttierClient {
                 }
                 Ok(Event::Incoming(Packet::PubComp(pubcomp))) => {
                     debug!("Received PUBCOMP for packet ID: {}", pubcomp.pkid);
-                    debug!("Received PUBCOMP for packet ID: {}", pubcomp.pkid);
-                    let pkid_i32 = pubcomp.pkid as i32;
-
-                    // Look up the pending publish and, if it's QoS 2, notify completion as Completed.
+                    let pkid_u16 = pubcomp.pkid;
+                    // If we have a pending publish for this packet id and it was QoS 12, notify completion as Completed.
                     {
-                        let mut state_guard = state.write().await;
-                        if let Some(existing) = state_guard.pending_publishes.get(&pkid_i32) {
+                        let pending_arc = state.read().await.pending_publishes.clone();
+                        let mut pending_map = pending_arc.lock().await;
+                        if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::ExactlyOnce {
-                                if let Some(pending) = state_guard.pending_publishes.remove(&pkid_i32) {
-                                    if let Some(completion) = pending.completion {
-                                        let _ = completion.send(PublishResult::Completed(pkid_i32));
-                                    }
+                                if let Some(pending) = pending_map.remove(&pkid_u16) {
+                                    let _ = pending.completion.send(PublishResult::Completed(pkid_u16));
                                 }
                             }
                         }
@@ -605,8 +674,12 @@ impl MqttierClient {
                 }
                 Ok(Event::Outgoing(outgoing)) => {
                     debug!("Outgoing event: {:?}", outgoing);
-                    // Outgoing events can be used to track when messages are sent
-                    // For now, we'll just log them
+                    // If the outgoing packet is a Publish, extract its packet id and send it to sent_queue_tx
+                    if let rumqttc::Outgoing::Publish(pkid) = outgoing {
+                        if let Err(e) = sent_queue_tx.send(pkid).await {
+                            error!("Failed to send pkid {} to sent_queue_tx: {}", pkid, e);
+                        }
+                    }
                 }
                 Err(e) => {
                     error!("Event loop error: {}", e);

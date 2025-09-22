@@ -41,26 +41,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // Start the MQTT client loop
+    println!("Starting MQTT client loop...");
+    client.run_loop().await?;
+
     let client1 = client.clone();
     let pub_task = tokio::spawn(async move {
         for i in 0..6 {
-            let publish_rx = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await.unwrap();
-            println!("Published message #{}", i);
+            let published_oneshot = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await.unwrap();
             
             // Wait for acknowledgment
-            match publish_rx.await {
-                Ok(Ok(result)) => println!("Message #{} acknowledged: {:?}", i, result),
-                Ok(Err(e)) => println!("Message #{} failed: {:?}", i, e),
+            let start = std::time::Instant::now();
+            match published_oneshot.await {
+                Ok(result) => {
+                    let elapsed = start.elapsed();
+                    println!(
+                        "Message QOS=1 #{} acknowledged: {:?} (waited {:?})",
+                        i, result, elapsed
+                    );
+                }
                 Err(_) => println!("Message #{} completion channel closed", i),
             }
-
             sleep(Duration::from_secs(3)).await;
+        }
+    });
+
+    let client11 = client.clone();
+    let pub_task = tokio::spawn(async move {
+        for i in 30..36 {
+            let published_oneshot = client11.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 2, false, None).await.unwrap();
+            
+            // Wait for acknowledgment
+            let start = std::time::Instant::now();
+            match published_oneshot.await {
+                Ok(result) => {
+                    let elapsed = start.elapsed();
+                    println!(
+                        "Message QOS=2 #{} completed: {:?} (waited {:?})",
+                        i, result, elapsed
+                    );
+                }
+                Err(_) => println!("Message #{} completion channel closed", i),
+            }
+            sleep(Duration::from_secs(4)).await;
+        }
+    });
+
+    let client111 = client.clone();
+    let pub_task = tokio::spawn(async move {
+        for i in 40..46 {
+            let published_oneshot = client111.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 0, false, None).await.unwrap();
+
+            // Wait for acknowledgment
+            let start = std::time::Instant::now();
+            match published_oneshot.await {
+                Ok(result) => {
+                    let elapsed = start.elapsed();
+                    println!(
+                        "Message QOS=0 #{} acknowledged: {:?} (waited {:?})",
+                        i, result, elapsed
+                    );
+                }
+                Err(_) => println!("Message #{} completion channel closed", i),
+            }
+            sleep(Duration::from_secs(2)).await;
         }
     });
 
     let client2 = client.clone();
     let pub_task2 = tokio::spawn(async move {
-        for i in 10..13 {
+        for i in 19..25 {
             let test_message = TestMessage {
                 id: i,
                 content: format!("Hello from another task #{}", i),
@@ -75,8 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             
             // Wait for acknowledgment
             match publish_rx.await {
-                Ok(Ok(result)) => println!("Structure message #{} acknowledged: {:?}", i, result),
-                Ok(Err(e)) => println!("Structure message #{} failed: {:?}", i, e),
+                Ok(result) => println!("Structure message #{} acknowledged: {:?}", i, result),
                 Err(_) => println!("Structure message #{} completion channel closed", i),
             }
 
@@ -87,9 +136,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Publish some test messages
     let client3 = client.clone();
     tokio::spawn(async move {
-        for i in 0..5 {
-            let _ = client3.publish_string("test/hello".to_string(), format!("Hello World {}", i), 1, true, None).await;
-            println!("Published hello message #{}", i);
+        for i in 0..9 {
+            let _ = client3.publish_string("test/hello".to_string(), format!("Hello World {}", i), 0, true, None).await;
+            println!("Published qos=0 hello message #{}", i);
 
             sleep(Duration::from_secs(2)).await;
         }
@@ -97,21 +146,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let client4 = client.clone();
     tokio::spawn(async move {
-        for i in 10..15 {
+        for i in 10..18 {
             let _ = client4.publish_state("test/state".to_string(), vec![i; 10], 1).await;
             println!("Published state message #{}", i);
             sleep(Duration::from_secs(3)).await;
         }
     });
 
-    sleep(Duration::from_secs(5)).await;
-
-    // Start the MQTT client loop
-    println!("Starting MQTT client loop...");
-    client.run_loop().await?;
 
     // Keep the program running for a bit to see the messages
-    sleep(Duration::from_secs(15)).await;
+    sleep(Duration::from_secs(25)).await;
 
     pub_task.await?;
     pub_task2.await?;
