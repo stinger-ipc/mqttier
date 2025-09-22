@@ -14,11 +14,11 @@ A Rust MQTT client library providing an abstracted interface around [rumqttc](ht
 
 ## Usage
 
-Add this to your `Cargo.toml`:
+Add this to your `Cargo.toml` (use the current crate version):
 
 ```toml
 [dependencies]
-mqttier = "0.1.0"
+mqttier = "0.2"
 ```
 
 
@@ -29,17 +29,17 @@ This example has been abbreviated to focus on library-specific calls.
 ```rust
 
 // Create a new MQTT client
-let client = MqttierClient::new("localhost", 1883, Some("mqttier_example".to_string()));
+let client = MqttierClient::new("localhost", 1883, Some("mqttier_example".to_string())).unwrap();
 
-// Start the run loop
-client.run_loop().await;
+// Start the run loop (spawned background tasks). Call once per client.
+client.run_loop().await.unwrap();
 
 // Create mpsc channel for receiving messages
 let (message_tx, mut message_rx) = mpsc::channel::<ReceivedMessage>(64);
 
-// Subscribe to a topic.  We pass in the tx-side of the channel that we want to be used
-// when a message is received for a subscription.  
-let subscription_id = client.subscribe("test/topic".to_string(), 0, message_tx).await;
+// Subscribe to a topic. We pass the tx-side of the channel that will receive messages
+// for this subscription. The function returns a subscription id (`usize`).
+let subscription_id = client.subscribe("test/topic".to_string(), 0, message_tx).await.unwrap();
 
 // Start a task to handle incoming messages
 tokio::spawn(async move {
@@ -50,8 +50,12 @@ tokio::spawn(async move {
     }
 });
 
-// Publish a message.
-client.publish_structure("test/topic".to_string(), &test_message).await;
+// Publish a serializable structure and wait for its publish completion
+let completion_rx = client.publish_structure("test/topic".to_string(), &test_message).await.unwrap();
+match completion_rx.await {
+    Ok(result) => println!("Publish result: {:?}", result),
+    Err(_) => println!("Publish completion channel closed"),
+}
 
 ```
 
@@ -69,26 +73,27 @@ Creates a new MQTT client.
 
 #### `run_loop() -> Result<()>`
 
-Starts the connection loop. This should be called once per client. If already running, this method does nothing.
+Starts the background run loop for connections and publishing. This should be called once per client. If already running, this method does nothing.
 
-#### `subscribe(topic: String, qos: u8, message_tx: mpsc::Sender<ReceivedMessage>) -> Result<u64>`
+#### `subscribe(topic: String, qos: u8, message_tx: mpsc::Sender<ReceivedMessage>) -> Result<usize>`
 
-Subscribes to a topic and returns a subscription ID.
+Subscribes to a topic and returns a subscription ID (`usize`).
 
 - `topic`: The MQTT topic to subscribe to
 - `qos`: The Quality of Service level (0, 1, or 2)
-- `message_tx`: The sender channel for delivering received messages (bounded channel with capacity 64)
-- Returns: The subscription ID (`u64`)
+- `message_tx`: The sender channel for delivering received messages (bounded channel with capacity you choose)
+- Returns: The subscription ID (`usize`)
 
 
-#### `publish_structure<T: Serialize>(topic: String, payload: T) -> Result<()>`
 
-Publishes a serializable struct as JSON to a topic with QoS 2.
+#### `publish_structure<T: Serialize>(topic: String, payload: T) -> Result<oneshot::Receiver<PublishResult>>`
+
+Publishes a serializable struct as JSON to a topic and returns a `oneshot::Receiver<PublishResult>` which will resolve with the publish outcome.
 
 - `topic`: The MQTT topic to publish to
 - `payload`: The struct to publish (must implement `Serialize`)
 
-#### `publish_request<T: Serialize>(topic: String, payload: T, response_topic: String, correlation_id: Vec<u8>) -> Result<()>`
+#### `publish_request<T: Serialize>(topic: String, payload: T, response_topic: String, correlation_id: Vec<u8>) -> Result<oneshot::Receiver<PublishResult>>`
 
 Publishes a request message with response topic and correlation ID.
 
@@ -97,7 +102,7 @@ Publishes a request message with response topic and correlation ID.
 - `response_topic`: The topic for responses
 - `correlation_id`: Correlation ID for matching responses (`Vec<u8>`)
 
-#### `publish_response<T: Serialize>(topic: String, payload: T, correlation_id: Vec<u8>) -> Result<()>`
+#### `publish_response<T: Serialize>(topic: String, payload: T, correlation_id: Vec<u8>) -> Result<oneshot::Receiver<PublishResult>>`
 
 Publishes a response message with correlation ID.
 
@@ -105,7 +110,7 @@ Publishes a response message with correlation ID.
 - `payload`: The struct to publish
 - `correlation_id`: Correlation ID for matching requests
 
-#### `publish_state<T: Serialize>(topic: String, payload: T, state_version: u32) -> Result<()>`
+#### `publish_state<T: Serialize>(topic: String, payload: T, state_version: u32) -> Result<oneshot::Receiver<PublishResult>>`
 
 Publishes a state message with a version property.
 
@@ -128,13 +133,10 @@ When disconnected:
 
 ### Logging
 
-The library uses the `tracing` crate. Initialize logging in your application:
+The library emits tracing events using the `tracing` crate. Initialize a tracing subscriber in your application, for example:
 
 ```rust
-tracing_subscriber::fmt()
-    .with_writer(std::io::stdout)
-    .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-    .init();
+tracing_subscriber::fmt().with_env_filter("info").init();
 ```
 
 ## Example
