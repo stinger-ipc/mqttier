@@ -411,6 +411,10 @@ impl MqttierClient {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
         props.correlation_data = Some(correlation_id.into());
+        props.user_properties.push((
+            "ReturnCode".to_string(),
+            "0".to_string(), // Placeholder for actual return code if needed
+        ));
         match serde_json::to_vec(&payload){
             Ok(payload_bytes) => {
                 self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
@@ -421,6 +425,42 @@ impl MqttierClient {
                 return completion_rx;
             }
         }
+    }
+
+    /// Publish an error response message to a topic with correlation id.
+    ///
+    /// This sends an empty JSON object `{}` as the payload, with user properties.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` - The topic to publish to
+    /// * `error_message` - The error message to send in the `DebugMessage` user property.
+    /// * `correlation_id` - The correlation id for matching requests
+    /// * `return_code` - The return code to send in the `ReturnCode` user property
+    /// 
+    /// # Returns
+    /// 
+    /// Returns a receiver that will be notified when the message is acknowledged by the broker.
+    pub async fn publish_error_response(
+        &self,
+        topic: String,
+        error_message: String,
+        correlation_id: Vec<u8>,
+        return_code: u32,
+    ) -> oneshot::Receiver<PublishResult> {
+        let mut props = PublishProperties::default();
+        props.content_type = Some("application/json".to_string());
+        props.correlation_data = Some(correlation_id.into());
+        props.user_properties.push((
+            "ReturnCode".to_string(),
+            return_code.to_string(),
+        ));
+        props.user_properties.push((
+            "DebugMessage".to_string(),
+            error_message
+        ));
+        let payload_bytes = b"{}".to_vec();
+        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
     }
 
     /// Publish a state message to a topic. Adds a user property `PropertyVersion` to the message properties.
