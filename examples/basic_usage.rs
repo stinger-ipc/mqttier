@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client1 = client.clone();
     let pub_task = tokio::spawn(async move {
         for i in 0..6 {
-            let published_oneshot = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await.unwrap();
+            let published_oneshot = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await;
             
             // Wait for acknowledgment
             let start = std::time::Instant::now();
@@ -69,7 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client11 = client.clone();
     let pub_task = tokio::spawn(async move {
         for i in 30..36 {
-            let published_oneshot = client11.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 2, false, None).await.unwrap();
+            let published_oneshot = client11.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 2, false, None).await;
             
             // Wait for acknowledgment
             let start = std::time::Instant::now();
@@ -90,7 +90,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client111 = client.clone();
     let pub_task = tokio::spawn(async move {
         for i in 40..46 {
-            let published_oneshot = client111.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 0, false, None).await.unwrap();
+            let published_oneshot = client111.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 0, false, None).await;
 
             // Wait for acknowledgment
             let start = std::time::Instant::now();
@@ -120,7 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_secs(),
             };
 
-            let publish_rx = client2.publish_structure("test/structure".to_string(), &test_message).await.unwrap();
+            let publish_rx = client2.publish_structure("test/structure".to_string(), &test_message).await;
             println!("Published structure message #{}", i);
             
             // Wait for acknowledgment

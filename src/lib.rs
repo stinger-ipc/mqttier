@@ -55,6 +55,9 @@ pub enum PublishResult {
     /// Timed Out
     TimedOut,
 
+    // Serialization Failed
+    SerializationError(String),
+
     /// Internal Error
     Error(String),
 }
@@ -260,7 +263,7 @@ impl MqttierClient {
     ///
     /// Returns: a `oneshot::Receiver<PublishResult>` that will resolve when the publish
     /// completes or errors.
-    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS , retain: bool, publish_props: Option<PublishProperties>) -> Result<oneshot::Receiver<PublishResult>> {
+    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS , retain: bool, publish_props: Option<PublishProperties>) -> oneshot::Receiver<PublishResult> {
         let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
         let publish_props = publish_props.unwrap_or_default();
         let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
@@ -286,8 +289,7 @@ impl MqttierClient {
             }
         }
 
-
-        Ok(completion_rx)
+        completion_rx
     }
 
     /// Publish a UTF-8 string payload to a topic.
@@ -310,12 +312,16 @@ impl MqttierClient {
         qos: u8,
         retain: bool,
         publish_props: Option<PublishProperties>,
-    ) -> Result<oneshot::Receiver<PublishResult>> {
+    ) -> oneshot::Receiver<PublishResult> {
         let rumqttc_qos = match qos {
             0 => QoS::AtMostOnce,
             1 => QoS::AtLeastOnce,
             2 => QoS::ExactlyOnce,
-            _ => return Err(MqttierError::InvalidQos(qos)),
+            _ => {
+                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+                completion_tx.send(PublishResult::Error(format!("Invalid QoS value: {}", qos))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
+                return completion_rx;
+            }
         };
         self.publish(topic, payload.into_bytes(), rumqttc_qos, retain, publish_props).await
     }
@@ -335,11 +341,19 @@ impl MqttierClient {
         &self,
         topic: String,
         payload: T,
-    ) -> Result<oneshot::Receiver<PublishResult>> {
+    ) -> oneshot::Receiver<PublishResult> {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+        match serde_json::to_vec(&payload){
+            Ok(payload_bytes) => {
+                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+            },
+            Err(e) => {
+                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
+                return completion_rx
+            }   
+        }
     }
 
     /// Publish a request message to a topic with response topic and correlation id.
@@ -360,13 +374,21 @@ impl MqttierClient {
         payload: T,
         response_topic: String,
         correlation_id: Vec<u8>,
-    ) -> Result<oneshot::Receiver<PublishResult>> {
+    ) -> oneshot::Receiver<PublishResult> {
         let mut props = PublishProperties::default();
         props.response_topic = Some(response_topic);
         props.correlation_data = Some(correlation_id.into());
         props.content_type = Some("application/json".to_string());
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+        match serde_json::to_vec(&payload){
+            Ok(payload_bytes) => {
+                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+            },
+            Err(e) => {
+                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
+                return completion_rx;
+            }
+        }
     }
 
     /// Publish a response message to a topic with correlation id.
@@ -385,12 +407,20 @@ impl MqttierClient {
         topic: String,
         payload: T,
         correlation_id: Vec<u8>,
-    ) -> Result<oneshot::Receiver<PublishResult>> {
+    ) -> oneshot::Receiver<PublishResult> {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
         props.correlation_data = Some(correlation_id.into());
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+        match serde_json::to_vec(&payload){
+            Ok(payload_bytes) => {
+                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+            },
+            Err(e) => {
+                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
+                return completion_rx;
+            }
+        }
     }
 
     /// Publish a state message to a topic. Adds a user property `PropertyVersion` to the message properties.
@@ -408,16 +438,24 @@ impl MqttierClient {
         topic: String,
         payload: T,
         state_version: u32,
-    ) -> Result<oneshot::Receiver<PublishResult>> {
+    ) -> oneshot::Receiver<PublishResult> {
         let mut props = PublishProperties::default();
         props.user_properties.push((
             "PropertyVersion".to_string(),
             state_version.to_string(),
         ));
         props.content_type = Some("application/json".to_string());
-        let payload_bytes = serde_json::to_vec(&payload)?;
-        info!("Publishing state to topic: {} with version: {}", topic, state_version);
-        self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props)).await
+        match serde_json::to_vec(&payload){
+            Ok(payload_bytes) => {
+                debug!("Publishing state to topic: {} with version: {}", topic, state_version);
+                self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props)).await
+            },
+            Err(e) => {
+                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
+                return completion_rx;
+            }
+        }
     }
 
     /// Start the run loop for handling MQTT connections and messages
