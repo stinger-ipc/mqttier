@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.run_loop().await?;
 
     let client1 = client.clone();
-    let pub_task = tokio::spawn(async move {
+    let _pub_task = tokio::spawn(async move {
         for i in 0..6 {
             let published_oneshot = client1.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 1, false, None).await;
             
@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let client11 = client.clone();
-    let pub_task = tokio::spawn(async move {
+    let _pub_task = tokio::spawn(async move {
         for i in 30..36 {
             let published_oneshot = client11.publish_string("test/string".to_string(), format!("Hello, MQTT! Message #{}", i), 2, false, None).await;
             

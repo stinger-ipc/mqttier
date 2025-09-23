@@ -62,6 +62,31 @@ pub enum PublishResult {
     Error(String),
 }
 
+impl std::fmt::Display for PublishResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PublishResult::Acknowledged(packet_id) => {
+                write!(f, "Message acknowledged by broker (packet ID: {})", packet_id)
+            }
+            PublishResult::Completed(packet_id) => {
+                write!(f, "Message transmission completed (packet ID: {})", packet_id)
+            }
+            PublishResult::Sent(packet_id) => {
+                write!(f, "Message sent, no acknowledgment expected (packet ID: {})", packet_id)
+            }
+            PublishResult::TimedOut => {
+                write!(f, "Message publish timed out")
+            }
+            PublishResult::SerializationError(msg) => {
+                write!(f, "Serialization failed: {}", msg)
+            }
+            PublishResult::Error(msg) => {
+                write!(f, "Publish error: {}", msg)
+            }
+        }
+    }
+}
+
 /// Completion signal for a published message
 type PublishCompletion = oneshot::Sender<PublishResult>;
 
@@ -319,7 +344,9 @@ impl MqttierClient {
             2 => QoS::ExactlyOnce,
             _ => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                completion_tx.send(PublishResult::Error(format!("Invalid QoS value: {}", qos))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
+                if let Err(pub_err) = completion_tx.send(PublishResult::Error(format!("Invalid QoS value: {}", qos))) {
+                    warn!("Failed to send publish result: {}", pub_err);
+                }
                 return completion_rx;
             }
         };
@@ -350,9 +377,11 @@ impl MqttierClient {
             },
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
-                return completion_rx
-            }   
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                    warn!("Failed to send publish result: {}", pub_err);
+                }
+                completion_rx
+            }
         }
     }
 
@@ -385,8 +414,10 @@ impl MqttierClient {
             },
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
-                return completion_rx;
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                    warn!("Failed to send publish result: {}", pub_err);
+                }
+                completion_rx
             }
         }
     }
@@ -421,8 +452,10 @@ impl MqttierClient {
             },
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
-                return completion_rx;
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                    warn!("Failed to send publish result: {}", pub_err);
+                }
+                completion_rx
             }
         }
     }
@@ -492,8 +525,10 @@ impl MqttierClient {
             },
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))).unwrap(); // Unwrap, because if we can't send to this oneshot we just created, we're in big trouble.
-                return completion_rx;
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                    warn!("Failed to send publish result: {}", pub_err);
+                }
+                completion_rx
             }
         }
     }
