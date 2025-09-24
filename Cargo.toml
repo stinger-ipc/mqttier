@@ -2,6 +2,15 @@
 name = "mqttier"
 version = "0.3.0"
 edition = "2024"
+authors = ["Jacob Brunson <github@jacobbrunson.com>"]
+description = "A Rust MQTT client library providing an abstracted interface around rumqttc."
+license = "LGPL-2.1"
+repository = "https://github.com/stinger-ipc/mqttier"
+readme = "README.md"
+keywords = ["mqtt", "async", "client", "iot", "rust"]
+categories = ["network-programming", "asynchronous", "api-bindings"]
+documentation = "https://docs.rs/mqttier"
+homepage = "https://github.com/stinger-ipc/mqttier"
 
 [dependencies]
 rumqttc = "0.24"
