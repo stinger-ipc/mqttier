@@ -1,19 +1,19 @@
 //! # MQTTier
-//! 
+//!
 //! A Rust MQTT client library providing an abstracted interface around rumqttc.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use tracing::{debug, error, info, warn};
-use rumqttc::v5::{MqttOptions, AsyncClient, EventLoop, Event};
-use rumqttc::v5::mqttbytes::v5::{PublishProperties, SubscribeProperties, Packet};
-use rumqttc::v5::mqttbytes::{QoS};
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
+use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
 use serde::Serialize;
 use thiserror::Error;
-use tokio::sync::{mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// Errors that can occur when using MqttierClient
@@ -66,13 +66,25 @@ impl std::fmt::Display for PublishResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             PublishResult::Acknowledged(packet_id) => {
-                write!(f, "Message acknowledged by broker (packet ID: {})", packet_id)
+                write!(
+                    f,
+                    "Message acknowledged by broker (packet ID: {})",
+                    packet_id
+                )
             }
             PublishResult::Completed(packet_id) => {
-                write!(f, "Message transmission completed (packet ID: {})", packet_id)
+                write!(
+                    f,
+                    "Message transmission completed (packet ID: {})",
+                    packet_id
+                )
             }
             PublishResult::Sent(packet_id) => {
-                write!(f, "Message sent, no acknowledgment expected (packet ID: {})", packet_id)
+                write!(
+                    f,
+                    "Message sent, no acknowledgment expected (packet ID: {})",
+                    packet_id
+                )
             }
             PublishResult::TimedOut => {
                 write!(f, "Message publish timed out")
@@ -182,21 +194,21 @@ pub struct MqttierClient {
 
 impl MqttierClient {
     /// Create a new `MqttierClient`.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `hostname` - The hostname of the MQTT broker
     /// * `port` - The port of the MQTT broker
     /// * `client_id` - Optional client ID. If None, a random UUID will be generated
     pub fn new(hostname: &str, port: u16, client_id: Option<String>) -> Result<Self> {
         let client_id = client_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        
+
         let mut mqttoptions = MqttOptions::new(client_id.clone(), hostname, port);
         mqttoptions.set_keep_alive(Duration::from_secs(60));
         mqttoptions.set_clean_start(true);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
-        
+
         // Create the sent queue channels (u16 packet ids)
         let (sent_queue_tx, sent_queue_rx) = mpsc::channel::<u16>(5);
         let (publish_queue_tx, publish_queue_rx) = mpsc::channel::<QueuedMessage>(100);
@@ -233,9 +245,9 @@ impl MqttierClient {
     }
 
     /// Subscribe to a topic.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     ///
     /// Arguments:
     /// - `topic`: topic to subscribe to
@@ -243,11 +255,18 @@ impl MqttierClient {
     /// - `received_message_tx`: mpsc Sender that will receive `ReceivedMessage`s for this subscription
     ///
     /// Returns: subscription id (usize) on success.
-    pub async fn subscribe(&self, topic: String, qos: u8, received_message_tx: mpsc::Sender<ReceivedMessage>) -> Result<usize> {
+    pub async fn subscribe(
+        &self,
+        topic: String,
+        qos: u8,
+        received_message_tx: mpsc::Sender<ReceivedMessage>,
+    ) -> Result<usize> {
         let subscription_id = self.next_subscription_id();
 
         let mut state = self.state.write().await;
-        state.subscriptions.insert(subscription_id, received_message_tx);
+        state
+            .subscriptions
+            .insert(subscription_id, received_message_tx);
         let subscription_props = SubscribeProperties {
             id: Some(subscription_id),
             user_properties: Vec::new(),
@@ -260,9 +279,14 @@ impl MqttierClient {
         };
         if state.is_connected {
             debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
-            self.client.subscribe_with_properties(&topic, rumqttc_qos, subscription_props).await?;
+            self.client
+                .subscribe_with_properties(&topic, rumqttc_qos, subscription_props)
+                .await?;
         } else {
-            debug!("Queueing subscription for topic: {} with QoS: {:?}", topic, qos);
+            debug!(
+                "Queueing subscription for topic: {} with QoS: {:?}",
+                topic, qos
+            );
             state.queued_subscriptions.push(QueuedSubscription {
                 topic,
                 qos: rumqttc_qos,
@@ -274,9 +298,9 @@ impl MqttierClient {
     }
 
     /// Publish a raw payload to a topic.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `topic` - The topic to publish to
     ///
     /// Arguments:
@@ -288,13 +312,23 @@ impl MqttierClient {
     ///
     /// Returns: a `oneshot::Receiver<PublishResult>` that will resolve when the publish
     /// completes or errors.
-    pub async fn publish(&self, topic: String, payload: Vec<u8>, qos: QoS , retain: bool, publish_props: Option<PublishProperties>) -> oneshot::Receiver<PublishResult> {
+    pub async fn publish(
+        &self,
+        topic: String,
+        payload: Vec<u8>,
+        qos: QoS,
+        retain: bool,
+        publish_props: Option<PublishProperties>,
+    ) -> oneshot::Receiver<PublishResult> {
         let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
         let publish_props = publish_props.unwrap_or_default();
         let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
 
         // If we have a publish queue, send through that.
-        debug!("Sending message to publish queue for topic: {} with QoS: {:?}", topic, qos);
+        debug!(
+            "Sending message to publish queue for topic: {} with QoS: {:?}",
+            topic, qos
+        );
         let message = QueuedMessage {
             topic,
             payload,
@@ -326,9 +360,9 @@ impl MqttierClient {
     /// * `qos` - The QoS level for the message (0, 1, or 2)
     /// * `retain` - Whether to retain the message
     /// * `publish_props` - Optional publish properties
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a receiver that will be notified when the message is acknowledged by the broker
     pub async fn publish_string(
         &self,
@@ -344,13 +378,22 @@ impl MqttierClient {
             2 => QoS::ExactlyOnce,
             _ => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::Error(format!("Invalid QoS value: {}", qos))) {
+                if let Err(pub_err) =
+                    completion_tx.send(PublishResult::Error(format!("Invalid QoS value: {}", qos)))
+                {
                     warn!("Failed to send publish result: {}", pub_err);
                 }
                 return completion_rx;
             }
         };
-        self.publish(topic, payload.into_bytes(), rumqttc_qos, retain, publish_props).await
+        self.publish(
+            topic,
+            payload.into_bytes(),
+            rumqttc_qos,
+            retain,
+            publish_props,
+        )
+        .await
     }
 
     /// Publish a serializable struct as JSON to a topic (QoS 2 by default in helper).
@@ -360,9 +403,9 @@ impl MqttierClient {
     /// * `topic` - The topic to publish to
     /// * `payload` - The serializable struct to send as payload
     /// * `state_version` - The version of the structure
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a receiver that will be notified when the message is acknowledged by the broker
     pub async fn publish_structure<T: Serialize>(
         &self,
@@ -371,13 +414,16 @@ impl MqttierClient {
     ) -> oneshot::Receiver<PublishResult> {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
-        match serde_json::to_vec(&payload){
+        match serde_json::to_vec(&payload) {
             Ok(payload_bytes) => {
-                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
-            },
+                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
+                    .await
+            }
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
+                    format!("Serialization error: {}", e),
+                )) {
                     warn!("Failed to send publish result: {}", pub_err);
                 }
                 completion_rx
@@ -393,9 +439,9 @@ impl MqttierClient {
     /// * `payload` - The serializable struct to send as payload
     /// * `response_topic` - The topic where responses should be sent
     /// * `correlation_id` - The correlation id for matching responses
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a receiver that will be notified when the message is acknowledged by the broker
     pub async fn publish_request<T: Serialize>(
         &self,
@@ -408,13 +454,16 @@ impl MqttierClient {
         props.response_topic = Some(response_topic);
         props.correlation_data = Some(correlation_id.into());
         props.content_type = Some("application/json".to_string());
-        match serde_json::to_vec(&payload){
+        match serde_json::to_vec(&payload) {
             Ok(payload_bytes) => {
-                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
-            },
+                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
+                    .await
+            }
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
+                    format!("Serialization error: {}", e),
+                )) {
                     warn!("Failed to send publish result: {}", pub_err);
                 }
                 completion_rx
@@ -429,9 +478,9 @@ impl MqttierClient {
     /// * `topic` - The topic to publish to
     /// * `payload` - The serializable struct to send as payload
     /// * `correlation_id` - The correlation id for matching requests
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a receiver that will be notified when the message is acknowledged by the broker
     pub async fn publish_response<T: Serialize>(
         &self,
@@ -446,13 +495,16 @@ impl MqttierClient {
             "ReturnCode".to_string(),
             "0".to_string(), // Placeholder for actual return code if needed
         ));
-        match serde_json::to_vec(&payload){
+        match serde_json::to_vec(&payload) {
             Ok(payload_bytes) => {
-                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
-            },
+                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
+                    .await
+            }
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
+                    format!("Serialization error: {}", e),
+                )) {
                     warn!("Failed to send publish result: {}", pub_err);
                 }
                 completion_rx
@@ -470,9 +522,9 @@ impl MqttierClient {
     /// * `error_message` - The error message to send in the `DebugMessage` user property.
     /// * `correlation_id` - The correlation id for matching requests
     /// * `return_code` - The return code to send in the `ReturnCode` user property
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a receiver that will be notified when the message is acknowledged by the broker.
     pub async fn publish_error_response(
         &self,
@@ -484,27 +536,26 @@ impl MqttierClient {
         let mut props = PublishProperties::default();
         props.content_type = Some("application/json".to_string());
         props.correlation_data = Some(correlation_id.into());
-        props.user_properties.push((
-            "ReturnCode".to_string(),
-            return_code.to_string(),
-        ));
-        props.user_properties.push((
-            "DebugMessage".to_string(),
-            error_message
-        ));
+        props
+            .user_properties
+            .push(("ReturnCode".to_string(), return_code.to_string()));
+        props
+            .user_properties
+            .push(("DebugMessage".to_string(), error_message));
         let payload_bytes = b"{}".to_vec();
-        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props)).await
+        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
+            .await
     }
 
     /// Publish a state message to a topic. Adds a user property `PropertyVersion` to the message properties.
     ///
     /// # Arguments
-    /// 
+    ///
     /// * `topic` - The topic to publish to
     /// * `payload` - The serializable struct to send as payload
-    /// 
+    ///
     /// # Returns
-    /// 
+    ///
     /// Returns a receiver that will be notified when the message is acknowledged by the broker
     pub async fn publish_state<T: Serialize>(
         &self,
@@ -513,19 +564,24 @@ impl MqttierClient {
         state_version: u32,
     ) -> oneshot::Receiver<PublishResult> {
         let mut props = PublishProperties::default();
-        props.user_properties.push((
-            "PropertyVersion".to_string(),
-            state_version.to_string(),
-        ));
+        props
+            .user_properties
+            .push(("PropertyVersion".to_string(), state_version.to_string()));
         props.content_type = Some("application/json".to_string());
-        match serde_json::to_vec(&payload){
+        match serde_json::to_vec(&payload) {
             Ok(payload_bytes) => {
-                debug!("Publishing state to topic: {} with version: {}", topic, state_version);
-                self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props)).await
-            },
+                debug!(
+                    "Publishing state to topic: {} with version: {}",
+                    topic, state_version
+                );
+                self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props))
+                    .await
+            }
             Err(e) => {
                 let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(format!("Serialization error: {}", e))) {
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
+                    format!("Serialization error: {}", e),
+                )) {
                     warn!("Failed to send publish result: {}", pub_err);
                 }
                 completion_rx
@@ -560,13 +616,15 @@ impl MqttierClient {
         tokio::spawn(async move {
             loop {
                 info!("Starting MQTT connection loop");
-                
+
                 // Take ownership of the eventloop
                 let mut eventloop_guard = eventloop.lock().await;
                 if let Some(mut el) = eventloop_guard.take() {
                     drop(eventloop_guard);
-                    
-                    match Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone()).await {
+
+                    match Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone())
+                        .await
+                    {
                         Ok(_) => {
                             info!("MQTT connection loop ended normally");
                         }
@@ -604,24 +662,34 @@ impl MqttierClient {
         // This should be the only publish loop, so we can lock the publish state here.
         let mut pub_state = publish_state.lock().await;
 
-    while let Some(mut message) = pub_state.publish_queue_rx.recv().await {
+        while let Some(mut message) = pub_state.publish_queue_rx.recv().await {
             debug!("Processing queued message for topic: {}", message.topic);
-            let publish_result: std::result::Result<(), rumqttc::v5::ClientError> = client.publish_with_properties(
-                &message.topic,
-                message.qos,
-                message.retain,
-                message.payload,
-                message.publish_props,
-            ).await;
+            let publish_result: std::result::Result<(), rumqttc::v5::ClientError> = client
+                .publish_with_properties(
+                    &message.topic,
+                    message.qos,
+                    message.retain,
+                    message.payload,
+                    message.publish_props,
+                )
+                .await;
 
             match publish_result {
                 Ok(_) => {
                     debug!("Published queued message for topic: {}", message.topic);
 
                     // After a successful publish call, wait for the sent packet id from the sent queue receiver
-                    match tokio::time::timeout(Duration::from_secs(5), pub_state.sent_queue_rx.recv()).await {
+                    match tokio::time::timeout(
+                        Duration::from_secs(5),
+                        pub_state.sent_queue_rx.recv(),
+                    )
+                    .await
+                    {
                         Ok(Some(packet_id)) => {
-                            debug!("Received sent packet id {} for topic: {}", packet_id, message.topic);
+                            debug!(
+                                "Received sent packet id {} for topic: {}",
+                                packet_id, message.topic
+                            );
                             // Ensure the client is connected before registering the pending publish so we can correlate acks.
                             loop {
                                 let state_read = state.read().await;
@@ -642,24 +710,38 @@ impl MqttierClient {
 
                             if let Some(sender) = message.completion.take() {
                                 let mut pp_map_guard = pub_state.pending_publishes.lock().await;
-                                pp_map_guard.insert(packet_id, PendingPublish {
-                                    qos: message.qos,
-                                    completion: sender,
-                                });
+                                pp_map_guard.insert(
+                                    packet_id,
+                                    PendingPublish {
+                                        qos: message.qos,
+                                        completion: sender,
+                                    },
+                                );
                             } else {
-                                error!("No completion channel provided for published message on topic: {}", message.topic);
+                                error!(
+                                    "No completion channel provided for published message on topic: {}",
+                                    message.topic
+                                );
                             }
                         }
                         Ok(None) => {
                             // sent_queue receiver closed unexpectedly
-                            error!("sent_queue_rx closed unexpectedly; cannot correlate published message for topic: {}", message.topic);
+                            error!(
+                                "sent_queue_rx closed unexpectedly; cannot correlate published message for topic: {}",
+                                message.topic
+                            );
                             if let Some(sender) = message.completion.take() {
-                                let _ = sender.send(PublishResult::Error("sent_queue receiver closed".to_string()));
+                                let _ = sender.send(PublishResult::Error(
+                                    "sent_queue receiver closed".to_string(),
+                                ));
                             }
                         }
                         Err(_) => {
                             // Timeout waiting for sent packet id
-                            warn!("Timed out waiting for sent packet id for topic: {}", message.topic);
+                            warn!(
+                                "Timed out waiting for sent packet id for topic: {}",
+                                message.topic
+                            );
                             if let Some(sender) = message.completion.take() {
                                 let _ = sender.send(PublishResult::TimedOut);
                             }
@@ -684,7 +766,6 @@ impl MqttierClient {
         state: &Arc<RwLock<ClientState>>,
         sent_queue_tx: mpsc::Sender<u16>,
     ) -> Result<()> {
-
         loop {
             debug!("Event loop polled");
             match eventloop.poll().await {
@@ -702,13 +783,22 @@ impl MqttierClient {
                     tokio::spawn(async move {
                         let mut state_guard = s.write().await;
                         for subscription in state_guard.queued_subscriptions.drain(..) {
-                            debug!("Processing queued subscription for topic: {}", subscription.topic);
-                            if let Err(e) = c.subscribe_with_properties(&subscription.topic, subscription.qos, subscription.props).await {
+                            debug!(
+                                "Processing queued subscription for topic: {}",
+                                subscription.topic
+                            );
+                            if let Err(e) = c
+                                .subscribe_with_properties(
+                                    &subscription.topic,
+                                    subscription.qos,
+                                    subscription.props,
+                                )
+                                .await
+                            {
                                 error!("Failed to subscribe to {}: {}", subscription.topic, e);
                             }
                         }
                     });
-
                 }
                 Ok(Event::Incoming(Packet::Publish(publish))) => {
                     let topic_str = String::from_utf8_lossy(&publish.topic).to_string();
@@ -736,14 +826,19 @@ impl MqttierClient {
                                 },
                                 subscription_id: subscription_id,
                                 response_topic: response_topic.clone(),
-                                correlation_data: correlation_data.clone().map(|data| data.to_vec()),
+                                correlation_data: correlation_data
+                                    .clone()
+                                    .map(|data| data.to_vec()),
                                 content_type: content_type.clone(),
                                 user_properties: user_props_map,
                             };
                             let state_guard = state.read().await;
                             if let Some(sender) = state_guard.subscriptions.get(&subscription_id) {
                                 if let Err(_) = sender.send(message.clone()).await {
-                                    warn!("Failed to send message to subscription {}", subscription_id);
+                                    warn!(
+                                        "Failed to send message to subscription {}",
+                                        subscription_id
+                                    );
                                 }
                             }
                         }
@@ -760,7 +855,9 @@ impl MqttierClient {
                         if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::AtLeastOnce {
                                 if let Some(pending) = pending_map.remove(&pkid_u16) {
-                                    let _ = pending.completion.send(PublishResult::Acknowledged(pkid_u16));
+                                    let _ = pending
+                                        .completion
+                                        .send(PublishResult::Acknowledged(pkid_u16));
                                 }
                             }
                         }
@@ -776,7 +873,8 @@ impl MqttierClient {
                         if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::ExactlyOnce {
                                 if let Some(pending) = pending_map.remove(&pkid_u16) {
-                                    let _ = pending.completion.send(PublishResult::Completed(pkid_u16));
+                                    let _ =
+                                        pending.completion.send(PublishResult::Completed(pkid_u16));
                                 }
                             }
                         }
