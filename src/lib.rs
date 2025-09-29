@@ -170,12 +170,15 @@ struct PublishState {
     pub ack_timeout_ms: Arc<RwLock<u64>>,
 }
 
+/// Represents a non-TLS connection to a broker based on its hostname and port.
 #[derive(Clone)]
 pub struct TcpConnection {
     pub hostname: String,
     pub port: u16,
 }
 
+/// Specifies what type of connection to make to the broker.
+/// TLS and websocket connections not currently supported.
 #[derive(Clone)]
 pub enum Connection {
     TcpLocalhost(u16),  // Specify the port of the localhost MQTT broker.
@@ -183,6 +186,7 @@ pub enum Connection {
     Tcp(TcpConnection), // Specify hostname and port.
 }
 
+/// Specifies messages to sent to a topic when the connection goes online or offline.
 #[derive(Clone)]
 pub struct OnlineMessage {
     pub topic: Bytes,
@@ -191,6 +195,7 @@ pub struct OnlineMessage {
     pub offline: Option<Bytes>,
 }
 
+/// Options for configuring the MqttierClient.
 #[derive(Clone, Builder)]
 pub struct MqttierOptions {
     pub connection: Connection,
