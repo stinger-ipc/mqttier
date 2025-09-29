@@ -2,15 +2,18 @@
 //!
 //! A Rust MQTT client library providing an abstracted interface around rumqttc.
 
+use bytes::Bytes;
+use derive_builder::Builder;
+use rumqttc::v5::mqttbytes::QoS;
+use rumqttc::v5::mqttbytes::v5::{
+    LastWill, LastWillProperties, Packet, PublishProperties, SubscribeProperties,
+};
+use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-
-use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
-use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
-use serde::Serialize;
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -163,6 +166,38 @@ struct PublishState {
     sent_queue_rx: mpsc::Receiver<u16>,
 
     pending_publishes: Arc<Mutex<HashMap<u16, PendingPublish>>>,
+
+    pub ack_timeout_ms: Arc<RwLock<u64>>,
+}
+
+#[derive(Clone)]
+pub struct TcpConnection {
+    pub hostname: String,
+    pub port: u16,
+}
+
+#[derive(Clone)]
+pub enum Connection {
+    TcpLocalhost(u16),  // Specify the port of the localhost MQTT broker.
+    UnixSocket(String), // Specify the path to the Unix socket.
+    Tcp(TcpConnection), // Specify hostname and port.
+}
+
+#[derive(Clone)]
+pub struct OnlineMessage {
+    pub topic: Bytes,
+    pub content_type: Option<String>,
+    pub online: Option<Bytes>,
+    pub offline: Option<Bytes>,
+}
+
+#[derive(Clone, Builder)]
+pub struct MqttierOptions {
+    pub connection: Connection,
+    pub client_id: Option<String>,
+    pub lwt: Option<OnlineMessage>,
+    pub ack_timeout_ms: Option<u64>,
+    pub keepalive_secs: Option<u16>,
 }
 
 /// MqttierClient provides an abstracted, cloneable interface around `rumqttc`.
@@ -200,14 +235,10 @@ impl MqttierClient {
     /// * `hostname` - The hostname of the MQTT broker
     /// * `port` - The port of the MQTT broker
     /// * `client_id` - Optional client ID. If None, a random UUID will be generated
-    pub fn new(hostname: &str, port: u16, client_id: Option<String>) -> Result<Self> {
-        let client_id = client_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-
-        let mut mqttoptions = MqttOptions::new(client_id.clone(), hostname, port);
-        mqttoptions.set_keep_alive(Duration::from_secs(60));
-        mqttoptions.set_clean_start(true);
-
-        let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+    pub fn new(mqttier_options: MqttierOptions) -> Result<Self> {
+        let client_id = mqttier_options
+            .client_id
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
 
         // Create the sent queue channels (u16 packet ids)
         let (sent_queue_tx, sent_queue_rx) = mpsc::channel::<u16>(5);
@@ -217,7 +248,72 @@ impl MqttierClient {
             publish_queue_rx,
             sent_queue_rx,
             pending_publishes: Arc::new(Mutex::new(HashMap::new())),
+            ack_timeout_ms: Arc::new(RwLock::new(
+                mqttier_options.ack_timeout_ms.unwrap_or(5000) as u64
+            )), // Default 5000 ms
         };
+
+        let (hostname, port) = {
+            match &mqttier_options.connection {
+                Connection::TcpLocalhost(tcp_port) => ("localhost".to_string(), *tcp_port),
+                Connection::Tcp(conn) => (conn.hostname.clone(), conn.port),
+                Connection::UnixSocket(path) => (path.clone(), 0),
+            }
+        };
+
+        let mut mqttoptions = MqttOptions::new(client_id.clone(), hostname, port);
+        mqttoptions.set_keep_alive(Duration::from_secs(
+            mqttier_options.keepalive_secs.unwrap_or(60) as u64,
+        ));
+        mqttoptions.set_clean_start(true);
+
+        if let Connection::UnixSocket(_socket_path) = mqttier_options.connection {
+            mqttoptions.set_transport(rumqttc::Transport::Unix);
+        }
+
+        if let Some(lwt) = mqttier_options.lwt {
+            if let Some(offline_payload) = lwt.offline {
+                // Default trait not implemented for LastWillProperties.
+                let mut lwt_props = LastWillProperties {
+                    delay_interval: None,
+                    payload_format_indicator: None,
+                    message_expiry_interval: None,
+                    content_type: None,
+                    response_topic: None,
+                    correlation_data: None,
+                    user_properties: Vec::new(),
+                };
+                if let Some(content_type) = lwt.content_type.clone() {
+                    lwt_props.content_type = Some(content_type);
+                }
+                mqttoptions.set_last_will(LastWill {
+                    topic: lwt.topic.clone(),
+                    message: offline_payload,
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    properties: Some(lwt_props),
+                });
+            }
+            if let Some(online_payload) = lwt.online {
+                let mut pub_props = PublishProperties::default();
+                if let Some(content_type) = lwt.content_type {
+                    pub_props.content_type = Some(content_type);
+                }
+                let q_mwg = QueuedMessage {
+                    topic: String::from_utf8_lossy(&lwt.topic).to_string(),
+                    payload: online_payload.to_vec(),
+                    qos: QoS::AtLeastOnce,
+                    retain: true,
+                    publish_props: pub_props,
+                    completion: None,
+                };
+                publish_queue_tx.try_send(q_mwg).unwrap_or_else(|e| {
+                    error!("Failed to queue LWT online message: {}", e);
+                });
+            }
+        }
+
+        let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
 
         let initial_state = ClientState {
             is_connected: false,
@@ -679,8 +775,12 @@ impl MqttierClient {
                     debug!("Published queued message for topic: {}", message.topic);
 
                     // After a successful publish call, wait for the sent packet id from the sent queue receiver
+                    let timeout_ms = {
+                        let ack_timeout_guard = pub_state.ack_timeout_ms.read().await;
+                        *ack_timeout_guard
+                    };
                     match tokio::time::timeout(
-                        Duration::from_secs(5),
+                        Duration::from_millis(timeout_ms),
                         pub_state.sent_queue_rx.recv(),
                     )
                     .await
@@ -907,14 +1007,49 @@ mod tests {
 
     #[tokio::test]
     async fn test_client_creation() {
-        let client = MqttierClient::new("localhost", 1883, None).unwrap();
+        let options = MqttierOptions {
+            connection: Connection::Tcp(TcpConnection {
+                hostname: "localhost".to_string(),
+                port: 1883,
+            }),
+            client_id: None,
+            lwt: None,
+            ack_timeout_ms: None,
+            keepalive_secs: None,
+        };
+        let client = MqttierClient::new(options).unwrap();
         assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
     }
 
     #[tokio::test]
     async fn test_client_creation_with_id() {
         let client_id = "test_client".to_string();
-        let _client = MqttierClient::new("localhost", 1883, Some(client_id)).unwrap();
+        let options = MqttierOptions {
+            connection: Connection::Tcp(TcpConnection {
+                hostname: "localhost".to_string(),
+                port: 1883,
+            }),
+            client_id: Some(client_id),
+            lwt: None,
+            ack_timeout_ms: None,
+            keepalive_secs: None,
+        };
+        let _client = MqttierClient::new(options).unwrap();
         // If we get here without panic, the test passes
+    }
+
+    #[tokio::test]
+    async fn test_client_creation_with_builder() {
+        let options = MqttierOptionsBuilder::default()
+            .connection(Connection::TcpLocalhost(1883))
+            .client_id(Some("builder_test_client".to_string()))
+            .lwt(None)
+            .ack_timeout_ms(Some(5000))
+            .keepalive_secs(Some(60))
+            .build()
+            .unwrap();
+
+        let client = MqttierClient::new(options).unwrap();
+        assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
     }
 }
