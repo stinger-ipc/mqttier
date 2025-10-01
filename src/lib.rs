@@ -232,6 +232,7 @@ pub struct MqttierOptions {
 #[derive(Clone)]
 pub struct MqttierClient {
     pub client_id: String,
+    pub online_topic: String,
     client: AsyncClient,
     state: Arc<RwLock<ClientState>>,
     next_subscription_id: Arc<AtomicUsize>,
@@ -346,6 +347,7 @@ impl MqttierClient {
 
         Ok(Self {
             client_id,
+            online_topic: String::from_utf8_lossy(&lwt_topic).to_string(),
             client,
             state: Arc::new(RwLock::new(initial_state)),
             next_subscription_id: Arc::new(AtomicUsize::new(5)),
