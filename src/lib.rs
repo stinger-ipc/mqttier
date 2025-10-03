@@ -709,6 +709,36 @@ impl MqttierClient {
         }
     }
 
+    pub async fn publish_status<T: Serialize>(
+        &self,
+        topic: String,
+        payload: T,
+        expiry_secs: u32,
+    ) -> oneshot::Receiver<PublishResult> {
+        let mut props = PublishProperties::default();
+        props.content_type = Some("application/json".to_string());
+        props.message_expiry_interval = Some(expiry_secs);
+        match serde_json::to_vec(&payload) {
+            Ok(payload_bytes) => {
+                debug!(
+                    "Publishing state to topic: {} with expiry: {}",
+                    topic, expiry_secs
+                );
+                self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props))
+                    .await
+            }
+            Err(e) => {
+                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
+                    format!("Serialization error: {}", e),
+                )) {
+                    warn!("Failed to send publish result: {}", pub_err);
+                }
+                completion_rx
+            }
+        }
+    }
+
     /// Start the run loop for handling MQTT connections and messages
     pub async fn run_loop(&self) -> Result<()> {
         let mut is_running = self.is_running.lock().await;
