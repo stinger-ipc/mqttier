@@ -264,7 +264,7 @@ impl MqttierClient {
             if let Some(topic) = &mqttier_options.lwt.topic {
                 topic.clone()
             } else {
-                Bytes::from(format!("mqttier/{}/online", client_id))
+                Bytes::from(format!("client/{}/online", client_id))
             }
         };
 
@@ -452,7 +452,7 @@ impl MqttierClient {
         let message = QueuedMessage {
             topic,
             payload,
-            qos: QoS::AtMostOnce, // TODO: use qos
+            qos,
             retain,
             publish_props,
             completion: Some(completion_tx),
@@ -802,18 +802,40 @@ impl MqttierClient {
         Ok(())
     }
 
+    async fn wait_for_connection(state: Arc<RwLock<ClientState>>) {
+        let mut i = 0;
+        loop {
+            let state_read = state.read().await;
+            if state_read.is_connected {
+                break;
+            }
+            drop(state_read);
+            if (i % 20) == 0 {
+                debug!("Waiting for mqtt connection");
+            }
+            i = i + 1;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
     /// Handle the publish loop - processes queued messages and waits for acknowledgments
     async fn publish_loop(
         client: AsyncClient,
         state: Arc<RwLock<ClientState>>,
         publish_state: Arc<Mutex<PublishState>>,
     ) {
-        info!("Starting publish loop");
+        debug!("Starting publish loop");
         // This should be the only publish loop, so we can lock the publish state here.
         let mut pub_state = publish_state.lock().await;
+        let pending_publishes_arc = pub_state.pending_publishes.clone();
 
         while let Some(mut message) = pub_state.publish_queue_rx.recv().await {
-            debug!("Processing queued message for topic: {}", message.topic);
+            MqttierClient::wait_for_connection(state.clone()).await;
+
+            // We lock this mutex here before publishing.  This prevents processing of the puback until we can insert into the pending_publishes map.
+            let mut pending_puback_map_guard = pending_publishes_arc.lock().await;
+
+            debug!("Publishing message to topic: {}", message.topic);
             let publish_result: std::result::Result<(), rumqttc::v5::ClientError> = client
                 .publish_with_properties(
                     &message.topic,
@@ -826,8 +848,6 @@ impl MqttierClient {
 
             match publish_result {
                 Ok(_) => {
-                    debug!("Published queued message for topic: {}", message.topic);
-
                     // After a successful publish call, wait for the sent packet id from the sent queue receiver
                     let timeout_ms = {
                         let ack_timeout_guard = pub_state.ack_timeout_ms.read().await;
@@ -839,20 +859,11 @@ impl MqttierClient {
                     )
                     .await
                     {
-                        Ok(Some(packet_id)) => {
+                        Ok(Some(packet_id)) => { // Another part of the code found the outgoing packet id and sent it here via sent_queue_rx.
                             debug!(
-                                "Received sent packet id {} for topic: {}",
-                                packet_id, message.topic
+                                "Published message to '{}' given packet id {}",
+                                message.topic, packet_id
                             );
-                            // Ensure the client is connected before registering the pending publish so we can correlate acks.
-                            loop {
-                                let state_read = state.read().await;
-                                if state_read.is_connected {
-                                    break;
-                                }
-                                drop(state_read);
-                                tokio::time::sleep(Duration::from_millis(100)).await;
-                            }
 
                             // If QoS is 0, immediately notify completion and continue without inserting into pending_publishes
                             if message.qos == QoS::AtMostOnce {
@@ -863,8 +874,7 @@ impl MqttierClient {
                             }
 
                             if let Some(sender) = message.completion.take() {
-                                let mut pp_map_guard = pub_state.pending_publishes.lock().await;
-                                pp_map_guard.insert(
+                                pending_puback_map_guard.insert(
                                     packet_id,
                                     PendingPublish {
                                         qos: message.qos,
@@ -872,7 +882,7 @@ impl MqttierClient {
                                     },
                                 );
                             } else {
-                                error!(
+                                info!(
                                     "No completion channel provided for published message on topic: {}",
                                     message.topic
                                 );
@@ -910,6 +920,7 @@ impl MqttierClient {
                     }
                 }
             }
+            drop(pending_puback_map_guard);
         }
     }
 
@@ -1001,48 +1012,56 @@ impl MqttierClient {
                 Ok(Event::Incoming(Packet::PubAck(puback))) => {
                     debug!("Received PUBACK for packet ID: {}.", puback.pkid);
                     let pkid_u16 = puback.pkid;
-
-                    // If we have a pending publish for this packet id and it was QoS 1, notify completion as Acknowledged.
-                    /*{
+                    let pending_arc: Arc<Mutex<HashMap<u16, PendingPublish>>> = state.read().await.pending_publishes.clone();
+                    
+                    // Since PUBACK requires mutex to the 'pending_publishes' map, we span a task to handle it
+                    // when the mutex is available so that we don't block the event loop.
+                    let _ = tokio::spawn(async move {
                         debug!("Processing PUBACK for packet ID: {}", pkid_u16);
-                        let pending_arc = state.read().await.pending_publishes.clone();
-                        debug!("Acquired pending publishes arc for PUBACK processing");
-                        let mut pending_map = pending_arc.lock().await;
-                        if let Some(existing) = pending_map.get(&pkid_u16) {
+                        let mut pending_map_guard = pending_arc.lock().await;
+
+                        if let Some(existing) = pending_map_guard.get(&pkid_u16) {
                             if existing.qos == QoS::AtLeastOnce {
-                                if let Some(pending) = pending_map.remove(&pkid_u16) {
+                                if let Some(pending) = pending_map_guard.remove(&pkid_u16) {
                                     let _ = pending
                                         .completion
                                         .send(PublishResult::Acknowledged(pkid_u16));
                                 } else {
-                                    warn!("Pending publish for pkid {} not found on PUBACK", pkid_u16);
+                                    error!("Couldn't get pending_publish channel for packet {}", pkid_u16);
                                 }
                             } else {
-                                warn!("Received PUBACK for pkid {} but QoS is not 1", pkid_u16);
+                                warn!("Received PUBACK for pkid {} but we recorded a QoS!=1 for this packet.", pkid_u16);
                             }
                         } else {
-                            warn!("No pending publish found for pkid {} on PUBACK", pkid_u16);
+                            warn!("No pending publish channel found for pkid {} on PUBACK", pkid_u16);
                         }
-                    }*/
+                    });
 
-                    debug!("Done processing PUBACK for packet ID: {}", pkid_u16);
                 }
                 Ok(Event::Incoming(Packet::PubComp(pubcomp))) => {
                     debug!("Received PUBCOMP for packet ID: {}", pubcomp.pkid);
                     let pkid_u16 = pubcomp.pkid;
-                    // If we have a pending publish for this packet id and it was QoS 12, notify completion as Completed.
-                    {
-                        let pending_arc = state.read().await.pending_publishes.clone();
+                    let pending_arc: Arc<Mutex<HashMap<u16, PendingPublish>>> = state.read().await.pending_publishes.clone();
+
+                    // Since PUBCOMP requires mutex to the 'pending_publishes' map, we span a task to handle it
+                    // when the mutex is available so that we don't block the event loop.
+                    let _ = tokio::spawn(async move {
                         let mut pending_map = pending_arc.lock().await;
                         if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::ExactlyOnce {
                                 if let Some(pending) = pending_map.remove(&pkid_u16) {
                                     let _ =
                                         pending.completion.send(PublishResult::Completed(pkid_u16));
+                                } else {
+                                    error!("Couldn't get pending_publish channel for packet {}", pkid_u16);
                                 }
+                            } else {
+                                warn!("Received PUBCOMP for pkid {} but we recorded a QoS!=2 for this packet.", pkid_u16);
                             }
+                        } else if pending_map.contains_key(&pkid_u16) {
+                            warn!("No pending publish channel found for pkid {} on PUBCOMP", pkid_u16);
                         }
-                    }
+                    });
                 }
                 Ok(Event::Incoming(packet)) => {
                     debug!("Received packet: {:?}", packet);
