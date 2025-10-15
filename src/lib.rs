@@ -452,7 +452,7 @@ impl MqttierClient {
         let message = QueuedMessage {
             topic,
             payload,
-            qos,
+            qos: QoS::AtMostOnce, // TODO: use qos
             retain,
             publish_props,
             completion: Some(completion_tx),
@@ -999,12 +999,14 @@ impl MqttierClient {
                     }
                 }
                 Ok(Event::Incoming(Packet::PubAck(puback))) => {
-                    debug!("Received PUBACK for packet ID: {}", puback.pkid);
+                    debug!("Received PUBACK for packet ID: {}.", puback.pkid);
                     let pkid_u16 = puback.pkid;
 
                     // If we have a pending publish for this packet id and it was QoS 1, notify completion as Acknowledged.
-                    {
+                    /*{
+                        debug!("Processing PUBACK for packet ID: {}", pkid_u16);
                         let pending_arc = state.read().await.pending_publishes.clone();
+                        debug!("Acquired pending publishes arc for PUBACK processing");
                         let mut pending_map = pending_arc.lock().await;
                         if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::AtLeastOnce {
@@ -1012,10 +1014,18 @@ impl MqttierClient {
                                     let _ = pending
                                         .completion
                                         .send(PublishResult::Acknowledged(pkid_u16));
+                                } else {
+                                    warn!("Pending publish for pkid {} not found on PUBACK", pkid_u16);
                                 }
+                            } else {
+                                warn!("Received PUBACK for pkid {} but QoS is not 1", pkid_u16);
                             }
+                        } else {
+                            warn!("No pending publish found for pkid {} on PUBACK", pkid_u16);
                         }
-                    }
+                    }*/
+
+                    debug!("Done processing PUBACK for packet ID: {}", pkid_u16);
                 }
                 Ok(Event::Incoming(Packet::PubComp(pubcomp))) => {
                     debug!("Received PUBCOMP for packet ID: {}", pubcomp.pkid);
