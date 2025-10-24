@@ -9,7 +9,6 @@ use rumqttc::v5::mqttbytes::v5::{
     LastWill, LastWillProperties, Packet, PublishProperties, SubscribeProperties,
 };
 use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -18,6 +17,8 @@ use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS as StingerQoS};
+use stinger_mqtt_trait::{MqttClient, MqttPublishSuccess};
 
 /// Errors that can occur when using MqttierClient
 #[derive(Error, Debug)]
@@ -123,36 +124,15 @@ struct QueuedSubscription {
 /// Represents a queued message to publish
 #[derive(Debug)]
 struct QueuedMessage {
-    topic: String,
-    payload: Vec<u8>,
-    qos: QoS,
-    retain: bool,
-    publish_props: PublishProperties,
+    message: MqttMessage,
     completion: Option<PublishCompletion>,
-}
-
-/// A message received from a subscription.
-///
-/// This is delivered to subscribers via the `mpsc::Sender<ReceivedMessage>` registered
-/// when calling `MqttierClient::subscribe`.
-#[derive(Debug, Clone)]
-pub struct ReceivedMessage {
-    pub topic: String,
-    pub payload: Vec<u8>,
-    pub qos: u8,
-    pub subscription_id: usize,
-    pub response_topic: Option<String>,
-    pub content_type: Option<String>,
-    pub correlation_data: Option<Vec<u8>>,
-    /// User properties from the MQTT5 publish properties. Keys and values are strings.
-    pub user_properties: HashMap<String, String>,
 }
 
 /// Internal state of the MqttierClient
 #[derive(Debug)]
 struct ClientState {
     is_connected: bool,
-    subscriptions: HashMap<usize, mpsc::Sender<ReceivedMessage>>,
+    subscriptions: HashMap<usize, mpsc::Sender<MqttMessage>>,
     queued_subscriptions: Vec<QueuedSubscription>,
     /// This is a map to PendingPublish structs keyed by packet ID. When we get an PUBACK or PUBCOMP, we look up the packet ID here to find the completion channel to notify.
     pending_publishes: Arc<Mutex<HashMap<u16, PendingPublish>>>,
@@ -372,14 +352,14 @@ impl MqttierClient {
     /// Arguments:
     /// - `topic`: topic to subscribe to
     /// - `qos`: QoS level (0, 1, 2)
-    /// - `received_message_tx`: mpsc Sender that will receive `ReceivedMessage`s for this subscription
+    /// - `received_message_tx`: mpsc Sender that will receive `MqttMessage`s for this subscription
     ///
     /// Returns: subscription id (usize) on success.
     pub async fn subscribe(
         &self,
         topic: String,
         qos: u8,
-        received_message_tx: mpsc::Sender<ReceivedMessage>,
+    received_message_tx: mpsc::Sender<MqttMessage>,
     ) -> Result<usize> {
         let subscription_id = self.next_subscription_id();
 
@@ -434,27 +414,18 @@ impl MqttierClient {
     /// completes or errors.
     pub async fn publish(
         &self,
-        topic: String,
-        payload: Vec<u8>,
-        qos: QoS,
-        retain: bool,
-        publish_props: Option<PublishProperties>,
+        msg: MqttMessage,
     ) -> oneshot::Receiver<PublishResult> {
         let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
-        let publish_props = publish_props.unwrap_or_default();
         let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
 
         // If we have a publish queue, send through that.
         debug!(
             "Sending message to publish queue for topic: {} with QoS: {:?}",
-            topic, qos
+            msg.topic, msg.qos
         );
         let message = QueuedMessage {
-            topic,
-            payload,
-            qos,
-            retain,
-            publish_props,
+            message: msg,
             completion: Some(completion_tx),
         };
         match self.publish_queue_tx.send(message).await {
@@ -468,275 +439,7 @@ impl MqttierClient {
             }
         }
 
-        completion_rx
-    }
-
-    /// Publish a UTF-8 string payload to a topic.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `payload` - The string payload to send
-    /// * `qos` - The QoS level for the message (0, 1, or 2)
-    /// * `retain` - Whether to retain the message
-    /// * `publish_props` - Optional publish properties
-    ///
-    /// # Returns
-    ///
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker
-    pub async fn publish_string(
-        &self,
-        topic: String,
-        payload: String,
-        qos: u8,
-        retain: bool,
-        publish_props: Option<PublishProperties>,
-    ) -> oneshot::Receiver<PublishResult> {
-        let rumqttc_qos = match qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            2 => QoS::ExactlyOnce,
-            _ => {
-                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) =
-                    completion_tx.send(PublishResult::Error(format!("Invalid QoS value: {}", qos)))
-                {
-                    warn!("Failed to send publish result: {}", pub_err);
-                }
-                return completion_rx;
-            }
-        };
-        self.publish(
-            topic,
-            payload.into_bytes(),
-            rumqttc_qos,
-            retain,
-            publish_props,
-        )
-        .await
-    }
-
-    /// Publish a serializable struct as JSON to a topic (QoS 2 by default in helper).
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `payload` - The serializable struct to send as payload
-    /// * `state_version` - The version of the structure
-    ///
-    /// # Returns
-    ///
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker
-    pub async fn publish_structure<T: Serialize>(
-        &self,
-        topic: String,
-        payload: T,
-    ) -> oneshot::Receiver<PublishResult> {
-        let mut props = PublishProperties::default();
-        props.content_type = Some("application/json".to_string());
-        match serde_json::to_vec(&payload) {
-            Ok(payload_bytes) => {
-                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
-                    .await
-            }
-            Err(e) => {
-                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
-                    format!("Serialization error: {}", e),
-                )) {
-                    warn!("Failed to send publish result: {}", pub_err);
-                }
-                completion_rx
-            }
-        }
-    }
-
-    /// Publish a request message to a topic with response topic and correlation id.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `payload` - The serializable struct to send as payload
-    /// * `response_topic` - The topic where responses should be sent
-    /// * `correlation_id` - The correlation id for matching responses
-    ///
-    /// # Returns
-    ///
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker
-    pub async fn publish_request<T: Serialize>(
-        &self,
-        topic: String,
-        payload: T,
-        response_topic: String,
-        correlation_id: Vec<u8>,
-    ) -> oneshot::Receiver<PublishResult> {
-        let mut props = PublishProperties::default();
-        props.response_topic = Some(response_topic);
-        props.correlation_data = Some(correlation_id.into());
-        props.content_type = Some("application/json".to_string());
-        match serde_json::to_vec(&payload) {
-            Ok(payload_bytes) => {
-                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
-                    .await
-            }
-            Err(e) => {
-                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
-                    format!("Serialization error: {}", e),
-                )) {
-                    warn!("Failed to send publish result: {}", pub_err);
-                }
-                completion_rx
-            }
-        }
-    }
-
-    /// Publish a response message to a topic with correlation id.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `payload` - The serializable struct to send as payload
-    /// * `correlation_id` - The correlation id for matching requests
-    ///
-    /// # Returns
-    ///
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker
-    pub async fn publish_response<T: Serialize>(
-        &self,
-        topic: String,
-        payload: T,
-        correlation_id: Vec<u8>,
-    ) -> oneshot::Receiver<PublishResult> {
-        let mut props = PublishProperties::default();
-        props.content_type = Some("application/json".to_string());
-        props.correlation_data = Some(correlation_id.into());
-        props.user_properties.push((
-            "ReturnCode".to_string(),
-            "0".to_string(), // Placeholder for actual return code if needed
-        ));
-        match serde_json::to_vec(&payload) {
-            Ok(payload_bytes) => {
-                self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
-                    .await
-            }
-            Err(e) => {
-                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
-                    format!("Serialization error: {}", e),
-                )) {
-                    warn!("Failed to send publish result: {}", pub_err);
-                }
-                completion_rx
-            }
-        }
-    }
-
-    /// Publish an error response message to a topic with correlation id.
-    ///
-    /// This sends an empty JSON object `{}` as the payload, with user properties.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `error_message` - The error message to send in the `DebugMessage` user property.
-    /// * `correlation_id` - The correlation id for matching requests
-    /// * `return_code` - The return code to send in the `ReturnCode` user property
-    ///
-    /// # Returns
-    ///
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker.
-    pub async fn publish_error_response(
-        &self,
-        topic: String,
-        error_message: String,
-        correlation_id: Vec<u8>,
-        return_code: u32,
-    ) -> oneshot::Receiver<PublishResult> {
-        let mut props = PublishProperties::default();
-        props.content_type = Some("application/json".to_string());
-        props.correlation_data = Some(correlation_id.into());
-        props
-            .user_properties
-            .push(("ReturnCode".to_string(), return_code.to_string()));
-        props
-            .user_properties
-            .push(("DebugMessage".to_string(), error_message));
-        let payload_bytes = b"{}".to_vec();
-        self.publish(topic, payload_bytes, QoS::ExactlyOnce, false, Some(props))
-            .await
-    }
-
-    /// Publish a state message to a topic. Adds a user property `PropertyVersion` to the message properties.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    /// * `payload` - The serializable struct to send as payload
-    ///
-    /// # Returns
-    ///
-    /// Returns a receiver that will be notified when the message is acknowledged by the broker
-    pub async fn publish_state<T: Serialize>(
-        &self,
-        topic: String,
-        payload: T,
-        state_version: u32,
-    ) -> oneshot::Receiver<PublishResult> {
-        let mut props = PublishProperties::default();
-        props
-            .user_properties
-            .push(("PropertyVersion".to_string(), state_version.to_string()));
-        props.content_type = Some("application/json".to_string());
-        match serde_json::to_vec(&payload) {
-            Ok(payload_bytes) => {
-                debug!(
-                    "Publishing state to topic: {} with version: {}",
-                    topic, state_version
-                );
-                self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props))
-                    .await
-            }
-            Err(e) => {
-                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
-                    format!("Serialization error: {}", e),
-                )) {
-                    warn!("Failed to send publish result: {}", pub_err);
-                }
-                completion_rx
-            }
-        }
-    }
-
-    pub async fn publish_status<T: Serialize>(
-        &self,
-        topic: String,
-        payload: T,
-        expiry_secs: u32,
-    ) -> oneshot::Receiver<PublishResult> {
-        let mut props = PublishProperties::default();
-        props.content_type = Some("application/json".to_string());
-        props.message_expiry_interval = Some(expiry_secs);
-        match serde_json::to_vec(&payload) {
-            Ok(payload_bytes) => {
-                debug!(
-                    "Publishing state to topic: {} with expiry: {}",
-                    topic, expiry_secs
-                );
-                self.publish(topic, payload_bytes, QoS::AtLeastOnce, true, Some(props))
-                    .await
-            }
-            Err(e) => {
-                let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-                if let Err(pub_err) = completion_tx.send(PublishResult::SerializationError(
-                    format!("Serialization error: {}", e),
-                )) {
-                    warn!("Failed to send publish result: {}", pub_err);
-                }
-                completion_rx
-            }
-        }
+        completion_rx.await
     }
 
     /// Start the run loop for handling MQTT connections and messages
@@ -829,20 +532,45 @@ impl MqttierClient {
         let mut pub_state = publish_state.lock().await;
         let pending_publishes_arc = pub_state.pending_publishes.clone();
 
-        while let Some(mut message) = pub_state.publish_queue_rx.recv().await {
+        while let Some(mut queued_message) = pub_state.publish_queue_rx.recv().await {
             MqttierClient::wait_for_connection(state.clone()).await;
+
+            debug!("Publishing message to topic: {}", queued_message.message.topic);
+            
+            let qos = {
+                match queued_message.message.qos {
+                    StingerQoS::AtMostOnce => QoS::AtMostOnce,
+                    StingerQoS::AtLeastOnce => QoS::AtLeastOnce,
+                    StingerQoS::ExactlyOnce => QoS::ExactlyOnce,
+                }
+            };
+
+            let mut pub_props = PublishProperties::default();
+            if Some(resp_topic) = queued_message.message.response_topic {
+                pub_props.response_topic = Some(resp_topic.clone());
+            }
+            if Some(corr_data) = queued_message.message.correlation_data {
+                pub_props.correlation_data = Some(corr_data.clone());
+            }
+            if queued_message.message.user_properties.len() > 0 {
+                let mut user_props_vec: Vec<(String, String)> = Vec::new();
+                for (k, v) in queued_message.message.user_properties.iter() {
+                    user_props_vec.push((k.clone(), v.clone()));
+                }
+                pub_props.user_properties = user_props_vec;
+            }
+
 
             // We lock this mutex here before publishing.  This prevents processing of the puback until we can insert into the pending_publishes map.
             let mut pending_puback_map_guard = pending_publishes_arc.lock().await;
 
-            debug!("Publishing message to topic: {}", message.topic);
             let publish_result: std::result::Result<(), rumqttc::v5::ClientError> = client
                 .publish_with_properties(
-                    &message.topic,
-                    message.qos,
-                    message.retain,
-                    message.payload,
-                    message.publish_props,
+                    queued_message.message.topic,
+                    qos,
+                    queued_message.message.retain,
+                    queued_message.message.payload,
+                    pub_props
                 )
                 .await;
 
@@ -981,22 +709,20 @@ impl MqttierClient {
                                 user_props_map.insert(k.clone(), v.clone());
                             }
 
-                            let message = ReceivedMessage {
-                                topic: topic_str.clone(),
-                                payload: publish.payload.to_vec(),
-                                qos: match publish.qos {
-                                    QoS::AtMostOnce => 0,
-                                    QoS::AtLeastOnce => 1,
-                                    QoS::ExactlyOnce => 2,
-                                },
-                                subscription_id: subscription_id,
-                                response_topic: response_topic.clone(),
-                                correlation_data: correlation_data
-                                    .clone()
-                                    .map(|data| data.to_vec()),
-                                content_type: content_type.clone(),
-                                user_properties: user_props_map,
-                            };
+                            let message = MqttMessageBuilder::default()
+                                .topic(&topic_str)
+                                .payload(publish.payload.clone())
+                                .subscription_id(subscription_id as i32)
+                                .response_topic(response_topic.clone())
+                                .correlation_data(correlation_data.clone())
+                                .content_type(content_type.clone())
+                                .user_properties(user_props_map)
+                                .qos(match publish.qos {
+                                    QoS::AtMostOnce => StingerQoS::AtMostOnce,
+                                    QoS::AtLeastOnce => StingerQoS::AtLeastOnce,
+                                    QoS::ExactlyOnce => StingerQoS::AtLeastOnce,
+                                })
+                                .build().unwrap();
                             let state_guard = state.read().await;
                             if let Some(sender) = state_guard.subscriptions.get(&subscription_id) {
                                 if let Err(_) = sender.send(message.clone()).await {

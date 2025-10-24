@@ -1,4 +1,4 @@
-use mqttier::{MqttierClient, ReceivedMessage};
+use mqttier::{MqttierClient, MqttMessage};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -19,11 +19,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Create a new MQTT client
-    let client = MqttierClient::new("localhost", 1883, Some("mqttc".to_string()))?;
+    // Create a new MQTT client using `MqttierOptions`
+    let options = mqttier::MqttierOptions {
+        connection: mqttier::Connection::Tcp(mqttier::TcpConnection {
+            hostname: "localhost".to_string(),
+            port: 1883,
+        }),
+        client_id: "mqttc".to_string(),
+        lwt: mqttier::OnlineMessage::default(),
+        ack_timeout_ms: 5000,
+        keepalive_secs: 60,
+    };
+    let client = MqttierClient::new(options)?;
 
     // Create mpsc channel for receiving messages
-    let (message_tx, mut message_rx) = mpsc::channel::<ReceivedMessage>(64);
+    let (message_tx, mut message_rx) = mpsc::channel::<MqttMessage>(64);
 
     // Subscribe to a topic
     let subscription_id = client
