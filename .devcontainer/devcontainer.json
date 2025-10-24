@@ -1,0 +1,16 @@
+// .devcontainer/devcontainer.json
+{
+  "name": "Rust Dev Environment",
+  // Use a pre-built image that includes Rust and Cargo
+  "image": "mcr.microsoft.com/devcontainers/rust:latest",
+  
+  // Optional: Extensions you might want pre-installed (e.g., Rust Analyzer)
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  }
+}
