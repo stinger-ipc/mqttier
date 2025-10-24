@@ -1,7 +1,7 @@
 [package]
 name = "mqttier"
-version = "0.4.5"
-edition = "2024"
+version = "0.5.0"
+edition = "2021"
 authors = ["Jacob Brunson <github@jacobbrunson.com>"]
 description = "A Rust MQTT client library providing an abstracted interface around rumqttc."
 license = "LGPL-2.1"
@@ -21,6 +21,9 @@ thiserror = "1.0"
 builder-pattern = "0.4"
 bytes = "1.10.1"
 stinger-mqtt-trait = "0.2.0"
+async-trait = "0.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

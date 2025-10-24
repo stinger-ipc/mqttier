@@ -385,11 +385,14 @@ dependencies = [
 
 [[package]]
 name = "mqttier"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
+ "async-trait",
  "builder-pattern",
  "bytes",
  "rumqttc",
+ "serde",
+ "serde_json",
  "stinger-mqtt-trait",
  "thiserror",
  "tokio",

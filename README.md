@@ -32,7 +32,7 @@ This example has been abbreviated to focus on library-specific calls.
 let client = MqttierClient::new("localhost", 1883, Some("mqttier_example".to_string())).unwrap();
 
 // Start the run loop (spawned background tasks). Call once per client.
-client.run_loop().await.unwrap();
+client.start().await.unwrap();
 
 // Create mpsc channel for receiving messages
 let (message_tx, mut message_rx) = mpsc::channel::<ReceivedMessage>(64);
@@ -71,7 +71,7 @@ Creates a new MQTT client.
 - `port`: The MQTT broker port
 - `client_id`: Optional client ID. If `None`, a random UUID is generated
 
-#### `run_loop() -> Result<()>`
+#### `start() -> Result<()>`
 
 Starts the background run loop for connections and publishing. This should be called once per client. If already running, this method does nothing.
 

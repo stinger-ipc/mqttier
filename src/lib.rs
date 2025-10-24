@@ -2,6 +2,7 @@
 //!
 //! A Rust MQTT client library providing an abstracted interface around rumqttc.
 
+use async_trait::async_trait;
 use builder_pattern::Builder;
 use bytes::Bytes;
 use rumqttc::v5::mqttbytes::QoS;
@@ -14,11 +15,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch, broadcast};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS as StingerQoS};
-use stinger_mqtt_trait::{MqttClient, MqttPublishSuccess};
+use stinger_mqtt_trait::{MqttClient, MqttPublishSuccess, MqttError, MqttConnectionState};
 
 /// Errors that can occur when using MqttierClient
 #[derive(Error, Debug)]
@@ -27,8 +28,6 @@ pub enum MqttierError {
     ConnectionError(#[from] rumqttc::v5::ConnectionError),
     #[error("MQTT client error: {0}")]
     ClientError(#[from] rumqttc::v5::ClientError),
-    #[error("Serialization error: {0}")]
-    SerializationError(#[from] serde_json::Error),
     #[error("Channel send error")]
     ChannelSendError,
     #[error("Invalid QoS value: {0}")]
@@ -132,7 +131,9 @@ struct QueuedMessage {
 #[derive(Debug)]
 struct ClientState {
     is_connected: bool,
-    subscriptions: HashMap<usize, mpsc::Sender<MqttMessage>>,
+    subscriptions: HashMap<usize, broadcast::Sender<MqttMessage>>,
+    /// Map from topic to subscription IDs
+    topic_to_subscription_ids: HashMap<String, Vec<usize>>,
     queued_subscriptions: Vec<QueuedSubscription>,
     /// This is a map to PendingPublish structs keyed by packet ID. When we get an PUBACK or PUBCOMP, we look up the packet ID here to find the completion channel to notify.
     pending_publishes: Arc<Mutex<HashMap<u16, PendingPublish>>>,
@@ -193,8 +194,6 @@ pub struct MqttierOptions {
     pub connection: Connection,
     #[default_lazy(||Uuid::new_v4().to_string())]
     pub client_id: String,
-    #[default(OnlineMessage::default())]
-    pub lwt: OnlineMessage,
     #[default(5000)]
     pub ack_timeout_ms: u64,
     #[default(60)]
@@ -205,14 +204,13 @@ pub struct MqttierOptions {
 ///
 /// Usage contract:
 /// - Construct with `MqttierClient::new(...)`.
-/// - Call `run_loop().await` once per client to start background tasks.
+/// - Call `start().await` once per client to start background tasks.
 /// - Use `subscribe(...)` to register a subscription and a channel sender for messages.
 /// - Use `publish*` helpers to publish data; they return a oneshot receiver that will be
 ///   resolved when the publish completes (or timed out / error).
 #[derive(Clone)]
 pub struct MqttierClient {
     pub client_id: String,
-    pub online_topic: String,
     client: AsyncClient,
     state: Arc<RwLock<ClientState>>,
     next_subscription_id: Arc<AtomicUsize>,
@@ -227,6 +225,15 @@ pub struct MqttierClient {
 
     /// Shared publish-related state (pending publishes, sent queue receiver, etc.)
     publish_state: Arc<Mutex<PublishState>>,
+
+    /// Connection state sender for broadcasting state changes
+    connection_state_tx: watch::Sender<MqttConnectionState>,
+
+    /// Connection state receiver for monitoring connection state
+    connection_state_rx: watch::Receiver<MqttConnectionState>,
+
+    /// MQTT connection options including LWT configuration
+    mqtt_options: Arc<RwLock<MqttOptions>>,
 }
 
 impl MqttierClient {
@@ -239,14 +246,6 @@ impl MqttierClient {
     /// * `client_id` - Optional client ID. If None, a random UUID will be generated
     pub fn new(mqttier_options: MqttierOptions) -> Result<Self> {
         let client_id = mqttier_options.client_id;
-
-        let lwt_topic = {
-            if let Some(topic) = &mqttier_options.lwt.topic {
-                topic.clone()
-            } else {
-                Bytes::from(format!("client/{}/online", client_id))
-            }
-        };
 
         // Create the sent queue channels (u16 packet ids)
         let (sent_queue_tx, sent_queue_rx) = mpsc::channel::<u16>(5);
@@ -275,59 +274,21 @@ impl MqttierClient {
             mqttoptions.set_transport(rumqttc::Transport::Unix);
         }
 
-        let lwt = mqttier_options.lwt;
-        if let Some(offline_payload) = lwt.offline {
-            // Default trait not implemented for LastWillProperties.
-            let mut lwt_props = LastWillProperties {
-                delay_interval: None,
-                payload_format_indicator: None,
-                message_expiry_interval: None,
-                content_type: None,
-                response_topic: None,
-                correlation_data: None,
-                user_properties: Vec::new(),
-            };
-            if let Some(content_type) = lwt.content_type.clone() {
-                lwt_props.content_type = Some(content_type);
-            }
-            mqttoptions.set_last_will(LastWill {
-                topic: lwt_topic.clone(),
-                message: offline_payload,
-                qos: QoS::AtLeastOnce,
-                retain: true,
-                properties: Some(lwt_props),
-            });
-        }
-        if let Some(online_payload) = lwt.online {
-            let mut pub_props = PublishProperties::default();
-            if let Some(content_type) = lwt.content_type {
-                pub_props.content_type = Some(content_type);
-            }
-            let q_mwg = QueuedMessage {
-                topic: String::from_utf8_lossy(&lwt_topic).to_string(),
-                payload: online_payload.to_vec(),
-                qos: QoS::AtLeastOnce,
-                retain: true,
-                publish_props: pub_props,
-                completion: None,
-            };
-            publish_queue_tx.try_send(q_mwg).unwrap_or_else(|e| {
-                error!("Failed to queue LWT online message: {}", e);
-            });
-        }
+        let (client, eventloop) = AsyncClient::new(mqttoptions.clone(), 10);
 
-        let (client, eventloop) = AsyncClient::new(mqttoptions, 10);
+        // Create connection state channel
+        let (connection_state_tx, connection_state_rx) = watch::channel(MqttConnectionState::Disconnected);
 
         let initial_state = ClientState {
             is_connected: false,
             subscriptions: HashMap::new(),
+            topic_to_subscription_ids: HashMap::new(),
             queued_subscriptions: Vec::new(),
             pending_publishes: initial_publish_state.pending_publishes.clone(),
         };
 
         Ok(Self {
             client_id,
-            online_topic: String::from_utf8_lossy(&lwt_topic).to_string(),
             client,
             state: Arc::new(RwLock::new(initial_state)),
             next_subscription_id: Arc::new(AtomicUsize::new(5)),
@@ -336,6 +297,9 @@ impl MqttierClient {
             publish_queue_tx,
             sent_queue_tx,
             publish_state: Arc::new(Mutex::new(initial_publish_state)),
+            connection_state_tx,
+            connection_state_rx,
+            mqtt_options: Arc::new(RwLock::new(mqttoptions)),
         })
     }
 
@@ -352,14 +316,14 @@ impl MqttierClient {
     /// Arguments:
     /// - `topic`: topic to subscribe to
     /// - `qos`: QoS level (0, 1, 2)
-    /// - `received_message_tx`: mpsc Sender that will receive `MqttMessage`s for this subscription
+    /// - `received_message_tx`: broadcast Sender that will receive `MqttMessage`s for this subscription
     ///
     /// Returns: subscription id (usize) on success.
     pub async fn subscribe(
         &self,
         topic: String,
         qos: u8,
-    received_message_tx: mpsc::Sender<MqttMessage>,
+        received_message_tx: broadcast::Sender<MqttMessage>,
     ) -> Result<usize> {
         let subscription_id = self.next_subscription_id();
 
@@ -367,6 +331,13 @@ impl MqttierClient {
         state
             .subscriptions
             .insert(subscription_id, received_message_tx);
+        
+        // Track topic to subscription ID mapping
+        state.topic_to_subscription_ids
+            .entry(topic.clone())
+            .or_insert_with(Vec::new)
+            .push(subscription_id);
+        
         let subscription_props = SubscribeProperties {
             id: Some(subscription_id),
             user_properties: Vec::new(),
@@ -397,51 +368,6 @@ impl MqttierClient {
         Ok(subscription_id)
     }
 
-    /// Publish a raw payload to a topic.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` - The topic to publish to
-    ///
-    /// Arguments:
-    /// - `topic`: topic to publish to
-    /// - `payload`: raw payload bytes
-    /// - `qos`: QoS (use `rumqttc::v5::mqttbytes::QoS` variants)
-    /// - `retain`: whether to set the retain flag
-    /// - `publish_props`: optional MQTT5 publish properties
-    ///
-    /// Returns: a `oneshot::Receiver<PublishResult>` that will resolve when the publish
-    /// completes or errors.
-    pub async fn publish(
-        &self,
-        msg: MqttMessage,
-    ) -> oneshot::Receiver<PublishResult> {
-        let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
-        let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
-
-        // If we have a publish queue, send through that.
-        debug!(
-            "Sending message to publish queue for topic: {} with QoS: {:?}",
-            msg.topic, msg.qos
-        );
-        let message = QueuedMessage {
-            message: msg,
-            completion: Some(completion_tx),
-        };
-        match self.publish_queue_tx.send(message).await {
-            Ok(_) => {}
-            Err(e) => {
-                // On error we get the message back so we can notify the original completion sender
-                let mut returned = e.0;
-                if let Some(sender) = returned.completion.take() {
-                    let _ = sender.send(PublishResult::Error("Channel send error".to_string()));
-                }
-            }
-        }
-
-        completion_rx.await
-    }
-
     /// Start the run loop for handling MQTT connections and messages
     pub async fn run_loop(&self) -> Result<()> {
         let mut is_running = self.is_running.lock().await;
@@ -457,6 +383,7 @@ impl MqttierClient {
         let eventloop = self.eventloop.clone();
         let publish_state = self.publish_state.clone();
         let sent_queue_tx = self.sent_queue_tx.clone();
+        let connection_state_tx = self.connection_state_tx.clone();
 
         // Start the publish loop
         let client_for_publish = client.clone();
@@ -475,7 +402,7 @@ impl MqttierClient {
                 if let Some(mut el) = eventloop_guard.take() {
                     drop(eventloop_guard);
 
-                    match Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone())
+                    match Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone(), connection_state_tx.clone())
                         .await
                     {
                         Ok(_) => {
@@ -495,6 +422,9 @@ impl MqttierClient {
                     let mut state_guard = state.write().await;
                     state_guard.is_connected = false;
                 }
+
+                // Update connection state
+                let _ = connection_state_tx.send(MqttConnectionState::Disconnected);
 
                 // Wait before reconnecting
                 warn!("Reconnecting in 5 seconds...");
@@ -535,7 +465,8 @@ impl MqttierClient {
         while let Some(mut queued_message) = pub_state.publish_queue_rx.recv().await {
             MqttierClient::wait_for_connection(state.clone()).await;
 
-            debug!("Publishing message to topic: {}", queued_message.message.topic);
+            let topic = queued_message.message.topic.clone();
+            debug!("Publishing message to topic: {}", topic);
             
             let qos = {
                 match queued_message.message.qos {
@@ -546,10 +477,10 @@ impl MqttierClient {
             };
 
             let mut pub_props = PublishProperties::default();
-            if Some(resp_topic) = queued_message.message.response_topic {
+            if let Some(resp_topic) = queued_message.message.response_topic {
                 pub_props.response_topic = Some(resp_topic.clone());
             }
-            if Some(corr_data) = queued_message.message.correlation_data {
+            if let Some(corr_data) = queued_message.message.correlation_data {
                 pub_props.correlation_data = Some(corr_data.clone());
             }
             if queued_message.message.user_properties.len() > 0 {
@@ -590,29 +521,29 @@ impl MqttierClient {
                         Ok(Some(packet_id)) => { // Another part of the code found the outgoing packet id and sent it here via sent_queue_rx.
                             debug!(
                                 "Published message to '{}' given packet id {}",
-                                message.topic, packet_id
+                                topic, packet_id
                             );
 
                             // If QoS is 0, immediately notify completion and continue without inserting into pending_publishes
-                            if message.qos == QoS::AtMostOnce {
-                                if let Some(sender) = message.completion.take() {
+                            if qos == QoS::AtMostOnce {
+                                if let Some(sender) = queued_message.completion.take() {
                                     let _ = sender.send(PublishResult::Sent(packet_id));
                                 }
                                 continue;
                             }
 
-                            if let Some(sender) = message.completion.take() {
+                            if let Some(sender) = queued_message.completion.take() {
                                 pending_puback_map_guard.insert(
                                     packet_id,
                                     PendingPublish {
-                                        qos: message.qos,
+                                        qos: qos,
                                         completion: sender,
                                     },
                                 );
                             } else {
                                 info!(
                                     "No completion channel provided for published message on topic: {}",
-                                    message.topic
+                                    topic
                                 );
                             }
                         }
@@ -620,9 +551,9 @@ impl MqttierClient {
                             // sent_queue receiver closed unexpectedly
                             error!(
                                 "sent_queue_rx closed unexpectedly; cannot correlate published message for topic: {}",
-                                message.topic
+                                topic
                             );
-                            if let Some(sender) = message.completion.take() {
+                            if let Some(sender) = queued_message.completion.take() {
                                 let _ = sender.send(PublishResult::Error(
                                     "sent_queue receiver closed".to_string(),
                                 ));
@@ -632,9 +563,9 @@ impl MqttierClient {
                             // Timeout waiting for sent packet id
                             warn!(
                                 "Timed out waiting for sent packet id for topic: {}",
-                                message.topic
+                                topic
                             );
-                            if let Some(sender) = message.completion.take() {
+                            if let Some(sender) = queued_message.completion.take() {
                                 let _ = sender.send(PublishResult::TimedOut);
                             }
                             continue;
@@ -642,8 +573,8 @@ impl MqttierClient {
                     }
                 }
                 Err(e) => {
-                    error!("Failed to publish message to {}: {}", message.topic, e);
-                    if let Some(sender) = message.completion.take() {
+                    error!("Failed to publish message to {}: {}", topic, e);
+                    if let Some(sender) = queued_message.completion.take() {
                         let _ = sender.send(PublishResult::Error(format!("{}", e)));
                     }
                 }
@@ -658,6 +589,7 @@ impl MqttierClient {
         eventloop: &mut EventLoop,
         state: &Arc<RwLock<ClientState>>,
         sent_queue_tx: mpsc::Sender<u16>,
+        connection_state_tx: watch::Sender<MqttConnectionState>,
     ) -> Result<()> {
         loop {
             debug!("Event loop polled");
@@ -669,6 +601,9 @@ impl MqttierClient {
                         let mut state_guard = state.write().await;
                         state_guard.is_connected = true;
                     }
+
+                    // Update connection state
+                    let _ = connection_state_tx.send(MqttConnectionState::Connected);
 
                     // Process queued subscriptions
                     let s = state.clone();
@@ -712,11 +647,12 @@ impl MqttierClient {
                             let message = MqttMessageBuilder::default()
                                 .topic(&topic_str)
                                 .payload(publish.payload.clone())
-                                .subscription_id(subscription_id as i32)
+                                .subscription_id(Some(subscription_id as u32))
                                 .response_topic(response_topic.clone())
                                 .correlation_data(correlation_data.clone())
                                 .content_type(content_type.clone())
                                 .user_properties(user_props_map)
+                                .retain(publish.retain)
                                 .qos(match publish.qos {
                                     QoS::AtMostOnce => StingerQoS::AtMostOnce,
                                     QoS::AtLeastOnce => StingerQoS::AtLeastOnce,
@@ -725,7 +661,7 @@ impl MqttierClient {
                                 .build().unwrap();
                             let state_guard = state.read().await;
                             if let Some(sender) = state_guard.subscriptions.get(&subscription_id) {
-                                if let Err(_) = sender.send(message.clone()).await {
+                                if let Err(_) = sender.send(message.clone()) {
                                     warn!(
                                         "Failed to send message to subscription {}",
                                         subscription_id
@@ -749,9 +685,10 @@ impl MqttierClient {
                         if let Some(existing) = pending_map_guard.get(&pkid_u16) {
                             if existing.qos == QoS::AtLeastOnce {
                                 if let Some(pending) = pending_map_guard.remove(&pkid_u16) {
-                                    let _ = pending
+                                    let puback_send_result = pending
                                         .completion
                                         .send(PublishResult::Acknowledged(pkid_u16));
+                                    debug!("Acknowledged PUBACK for packet ID: {} - {:?}", pkid_u16, puback_send_result);
                                 } else {
                                     error!("Couldn't get pending_publish channel for packet {}", pkid_u16);
                                 }
@@ -810,6 +747,314 @@ impl MqttierClient {
     }
 }
 
+#[async_trait]
+impl MqttClient for MqttierClient {
+    fn get_client_id(&self) -> String {
+        self.client_id.clone()
+    }
+
+    fn get_state(&self) -> watch::Receiver<MqttConnectionState> {
+        self.connection_state_rx.clone()
+    }
+
+    async fn connect(&mut self, _uri: String) -> std::result::Result<(), MqttError> {
+        // Note: MqttierClient is designed to connect at construction time with connection
+        // details specified in MqttierOptions. The URI parameter is currently ignored.
+        // To properly support dynamic connection URIs would require significant refactoring.
+        
+        // Start the run loop if not already running
+        let is_running = {
+            let guard = self.is_running.lock().await;
+            *guard
+        };
+        
+        if !is_running {
+            self.run_loop()
+                .await
+                .map_err(|e| MqttError::ConnectionError(format!("{}", e)))?;
+        }
+        
+        // Wait for connection to be established
+        let mut state_rx = self.connection_state_rx.clone();
+        
+        // Use timeout to avoid waiting forever
+        let timeout_duration = Duration::from_secs(30);
+        let start_time = std::time::Instant::now();
+        
+        loop {
+            if let Ok(_) = state_rx.changed().await {
+                let state = state_rx.borrow().clone();
+                if matches!(state, MqttConnectionState::Connected) {
+                    return Ok(());
+                }
+            }
+            
+            if start_time.elapsed() > timeout_duration {
+                return Err(MqttError::TimeoutError("Connection timeout".to_string()));
+            }
+            
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    fn set_last_will(&mut self, message: MqttMessage) {
+        // Convert MqttMessage to rumqttc's LastWill format and store in MqttOptions
+        let mqtt_options = self.mqtt_options.clone();
+        tokio::spawn(async move {
+            let mut opts_guard = mqtt_options.write().await;
+            
+            // Convert QoS
+            let qos = match message.qos {
+                StingerQoS::AtMostOnce => QoS::AtMostOnce,
+                StingerQoS::AtLeastOnce => QoS::AtLeastOnce,
+                StingerQoS::ExactlyOnce => QoS::ExactlyOnce,
+            };
+            
+            // Build LastWillProperties
+            let lwt_props = LastWillProperties {
+                delay_interval: None,
+                payload_format_indicator: None,
+                message_expiry_interval: None,
+                content_type: message.content_type.clone(),
+                response_topic: message.response_topic.clone(),
+                correlation_data: message.correlation_data.clone(),
+                user_properties: message.user_properties.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            };
+            
+            // Create LastWill
+            let last_will = LastWill {
+                topic: Bytes::from(message.topic.into_bytes()),
+                message: message.payload.into(),
+                qos,
+                retain: message.retain,
+                properties: Some(lwt_props),
+            };
+            
+            opts_guard.set_last_will(last_will);
+        });
+    }
+
+    async fn subscribe(&mut self, topic: String, qos: stinger_mqtt_trait::message::QoS, tx: broadcast::Sender<MqttMessage>) -> std::result::Result<i32, MqttError> {
+        // Convert QoS from trait to internal representation
+        let rumqttc_qos = match qos {
+            stinger_mqtt_trait::message::QoS::AtMostOnce => QoS::AtMostOnce,
+            stinger_mqtt_trait::message::QoS::AtLeastOnce => QoS::AtLeastOnce,
+            stinger_mqtt_trait::message::QoS::ExactlyOnce => QoS::ExactlyOnce,
+        };
+
+        // Get subscription ID
+        let subscription_id = self.next_subscription_id();
+
+        // Register the subscription
+        let mut state = self.state.write().await;
+        state.subscriptions.insert(subscription_id, tx);
+        
+        // Track topic to subscription ID mapping
+        state.topic_to_subscription_ids
+            .entry(topic.clone())
+            .or_insert_with(Vec::new)
+            .push(subscription_id);
+        
+        let subscription_props = SubscribeProperties {
+            id: Some(subscription_id),
+            user_properties: Vec::new(),
+        };
+
+        if state.is_connected {
+            debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
+            drop(state); // Release the lock before await
+            self.client
+                .subscribe_with_properties(&topic, rumqttc_qos, subscription_props)
+                .await
+                .map_err(|e| MqttError::SubscriptionError(format!("{}", e)))?;
+        } else {
+            debug!(
+                "Queueing subscription for topic: {} with QoS: {:?}",
+                topic, qos
+            );
+            state.queued_subscriptions.push(QueuedSubscription {
+                topic,
+                qos: rumqttc_qos,
+                props: subscription_props,
+            });
+        }
+
+        Ok(subscription_id as i32)
+    }
+
+    async fn unsubscribe(&mut self, topic: String) -> std::result::Result<(), MqttError> {
+        let mut state = self.state.write().await;
+        
+        // Remove all subscription IDs for this topic
+        if let Some(subscription_ids) = state.topic_to_subscription_ids.remove(&topic) {
+            for subscription_id in subscription_ids {
+                state.subscriptions.remove(&subscription_id);
+            }
+        }
+        
+        // Remove from queued subscriptions if not connected yet
+        state.queued_subscriptions.retain(|sub| sub.topic != topic);
+        
+        // If connected, send unsubscribe to broker
+        if state.is_connected {
+            drop(state); // Release the lock before await
+            self.client
+                .unsubscribe(&topic)
+                .await
+                .map_err(|e| MqttError::UnsubscribeError(format!("{}", e)))?;
+        }
+        
+        Ok(())
+    }
+
+    async fn disconnect(&mut self) -> std::result::Result<(), MqttError> {
+        // Update connection state
+        let _ = self.connection_state_tx.send(MqttConnectionState::Disconnected);
+        
+        // Mark as disconnected in state
+        {
+            let mut state = self.state.write().await;
+            state.is_connected = false;
+        }
+        
+        // Send disconnect to broker
+        self.client
+            .disconnect()
+            .await
+            .map_err(|e| MqttError::DisconnectionError(format!("{}", e)))?;
+        
+        Ok(())
+    }
+
+    async fn publish(&mut self, message: MqttMessage) -> std::result::Result<MqttPublishSuccess, MqttError> {
+        let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
+        let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+
+        // If we have a publish queue, send through that.
+        debug!(
+            "Sending message to publish queue for topic: {} with QoS: {:?}",
+            message.topic, message.qos
+        );
+        let topic = message.topic.clone();
+        let queued_message = QueuedMessage {
+            message,
+            completion: Some(completion_tx),
+        };
+        match self.publish_queue_tx.send(queued_message).await {
+            Ok(_) => {
+                debug!("Message to {} queued for publish", topic);
+            }
+            Err(e) => {
+                // On error we get the message back so we can notify the original completion sender
+                let mut returned = e.0;
+                if let Some(sender) = returned.completion.take() {
+                    let _ = sender.send(PublishResult::Error("Channel send error".to_string()));
+                }
+            }
+        }
+        
+        match tokio::time::timeout(Duration::from_millis(5000), completion_rx).await {
+            Ok(Ok(result)) => match result {
+                PublishResult::Acknowledged(_pkid) => {
+                    Ok(MqttPublishSuccess::Acknowledged)
+                }
+                PublishResult::Completed(_pkid) => {
+                    Ok(MqttPublishSuccess::Completed)
+                }
+                PublishResult::Sent(_pkid) => {
+                    Ok(MqttPublishSuccess::Sent)
+                }
+                PublishResult::TimedOut => Err(MqttError::TimeoutError("Publish timeout".to_string())),
+                PublishResult::SerializationError(msg) => Err(MqttError::PublishError(msg)),
+                PublishResult::Error(msg) => Err(MqttError::PublishError(msg)),
+            },
+            Ok(Err(_)) => Err(MqttError::PublishError("Channel receive error".to_string())),
+            Err(_) => Err(MqttError::TimeoutError(format!("Publish completion timeout after 5000ms"))),
+        }
+    }
+
+    fn nowait_publish(&mut self, message: MqttMessage) -> std::result::Result<MqttPublishSuccess, MqttError> {
+        debug!(
+            "Queueing message for fire-and-forget publish to topic: {} with QoS: {:?}",
+            message.topic, message.qos
+        );
+        
+        let queued_message = QueuedMessage {
+            message,
+            completion: None, // No completion channel for fire-and-forget
+        };
+        
+        // Use try_send since this is a non-async method
+        self.publish_queue_tx
+            .try_send(queued_message)
+            .map_err(|e| MqttError::PublishError(format!("Failed to queue message: {}", e)))?;
+        
+        // Return Sent immediately without waiting
+        Ok(MqttPublishSuccess::Sent)
+    }
+
+    async fn start(&mut self) -> std::result::Result<(), MqttError> {
+        self.run_loop()
+            .await
+            .map_err(|e| MqttError::ConnectionError(format!("{}", e)))
+    }
+
+    async fn clean_stop(&mut self) -> std::result::Result<(), MqttError> {
+        // Mark as not running
+        {
+            let mut is_running = self.is_running.lock().await;
+            *is_running = false;
+        }
+        
+        // Disconnect from broker
+        self.disconnect().await?;
+        
+        Ok(())
+    }
+
+    async fn force_stop(&mut self) -> std::result::Result<(), MqttError> {
+        // Mark as not running
+        {
+            let mut is_running = self.is_running.lock().await;
+            *is_running = false;
+        }
+        
+        // Update connection state immediately without waiting for broker
+        let _ = self.connection_state_tx.send(MqttConnectionState::Disconnected);
+        
+        // Mark as disconnected in state
+        {
+            let mut state = self.state.write().await;
+            state.is_connected = false;
+        }
+        
+        // Note: We don't call client.disconnect() for force_stop - just update state
+        // The event loop will handle cleanup when it detects is_running is false
+        
+        Ok(())
+    }
+
+    async fn reconnect(&mut self, _clean_start: bool) -> std::result::Result<(), MqttError> {
+        // Disconnect if currently connected
+        {
+            let state = self.state.read().await;
+            if state.is_connected {
+                drop(state);
+                self.disconnect().await?;
+            }
+        }
+        
+        // The run_loop's reconnection logic will automatically reconnect
+        // Note: clean_start parameter is currently not implemented as it would require
+        // recreating the client with new MqttOptions. The client always uses clean_start=true
+        // from initialization.
+        
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -822,7 +1067,6 @@ mod tests {
                 port: 1883,
             }),
             client_id: "test_client".to_string(),
-            lwt: OnlineMessage::default(),
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
         };
@@ -839,7 +1083,6 @@ mod tests {
                 port: 1883,
             }),
             client_id: client_id,
-            lwt: OnlineMessage::default(),
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
         };
