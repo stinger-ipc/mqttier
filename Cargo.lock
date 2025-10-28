@@ -378,7 +378,7 @@ dependencies = [
 
 [[package]]
 name = "mqttier"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "async-trait",
  "builder-pattern",
@@ -738,13 +738,14 @@ dependencies = [
 
 [[package]]
 name = "stinger-mqtt-trait"
-version = "0.2.4"
+version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "162781721b10cad8325502b5391b4f82fc524fac5d3f0ef1e940030cde3c6294"
+checksum = "a8fbadcdfc0a224a76cb74d92b7efc9fba284f91474ecdfc2a87836dcafedd58"
 dependencies = [
  "async-trait",
  "bytes",
  "derive_builder",
+ "rumqttc",
  "serde",
  "serde_json",
  "tokio",

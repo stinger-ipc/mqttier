@@ -768,7 +768,7 @@ impl MqttClient for MqttierClient {
         });
     }
 
-    async fn subscribe(&mut self, topic: String, qos: stinger_mqtt_trait::message::QoS, tx: broadcast::Sender<MqttMessage>) -> std::result::Result<i32, MqttError> {
+    async fn subscribe(&mut self, topic: String, qos: stinger_mqtt_trait::message::QoS, tx: broadcast::Sender<MqttMessage>) -> std::result::Result<u32, MqttError> {
         // Convert QoS from trait to internal representation
         let rumqttc_qos = match qos {
             stinger_mqtt_trait::message::QoS::AtMostOnce => QoS::AtMostOnce,
@@ -813,7 +813,7 @@ impl MqttClient for MqttierClient {
             });
         }
 
-        Ok(subscription_id as i32)
+        Ok(subscription_id as u32)
     }
 
     async fn unsubscribe(&mut self, topic: String) -> std::result::Result<(), MqttError> {
@@ -1037,5 +1037,34 @@ mod tests {
         };
         let _client = MqttierClient::new(options).unwrap();
         // If we get here without panic, the test passes
+    }
+}
+
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    use stinger_mqtt_trait::MqttClient;
+    use stinger_mqtt_trait::validation;
+
+    /// Test that MqttierClient properly implements the MqttClient trait
+    #[tokio::test]
+    async fn test_mqtt_client_trait_implementation() {
+        // This test verifies that MqttierClient implements the MqttClient trait correctly
+        let options = MqttierOptions {
+            connection: Connection::TcpLocalhost(1883),
+            client_id: "trait_test_client".to_string(),
+            ack_timeout_ms: 5000,
+            keepalive_secs: 60,
+        };
+        
+        let client = MqttierClient::new(options).expect("Failed to create client");
+        
+        // Verify trait methods are available
+        assert_eq!(client.get_client_id(), "trait_test_client");
+        
+        // Verify connection state is accessible
+        let state_rx = client.get_state();
+        let current_state = *state_rx.borrow();
+        assert_eq!(current_state, MqttConnectionState::Disconnected);
     }
 }
