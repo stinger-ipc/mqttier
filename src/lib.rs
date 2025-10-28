@@ -442,12 +442,12 @@ impl MqttierClient {
             match publish_result {
                 Ok(_) => {
                     // After a successful publish call, wait for the sent packet id from the sent queue receiver
-                    let timeout_ms = {
-                        let ack_timeout_guard = pub_state.ack_timeout_ms.read().await;
-                        *ack_timeout_guard
-                    };
+                    //let timeout_ms = {
+                    //    let ack_timeout_guard = pub_state.ack_timeout_ms.read().await;
+                    //    *ack_timeout_guard
+                    //};
                     match tokio::time::timeout(
-                        Duration::from_millis(timeout_ms),
+                        Duration::from_millis(5000),
                         pub_state.sent_queue_rx.recv(),
                     )
                     .await
@@ -667,6 +667,8 @@ impl MqttierClient {
                     if let rumqttc::Outgoing::Publish(pkid) = outgoing {
                         if let Err(e) = sent_queue_tx.send(pkid).await {
                             error!("Failed to send pkid {} to sent_queue_tx: {}", pkid, e);
+                        } else {
+                            debug!("Sent pkid {} to sent_queue_tx", pkid);
                         }
                     }
                 }
