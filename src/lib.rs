@@ -36,74 +36,8 @@ pub enum MqttierError {
 
 type Result<T> = std::result::Result<T, MqttierError>;
 
-/// Result of a publish operation indicating when the message lifecycle completed.
-///
-/// Variants:
-/// - `Acknowledged(pkid)` - QoS 1: broker acknowledged the publish (PUBACK)
-/// - `Completed(pkid)` - QoS 2: publish flow completed (PUBCOMP)
-/// - `Sent(pkid)` - QoS 0: message was sent but no broker ack expected
-/// - `TimedOut` - waiting for the send packet id timed out
-/// - `Error(..)` - internal or channel errors
-#[derive(Debug)]
-pub enum PublishResult {
-    /// Message was acknowledged by broker (QoS 1 PUBACK)
-    Acknowledged(u16),
-
-    /// Message transmission to broker was completed (QoS 2 PUBCOMP)
-    Completed(u16),
-
-    /// No acknowledgment expected (QoS 0)
-    Sent(u16),
-
-    /// Timed Out
-    TimedOut,
-
-    // Serialization Failed
-    SerializationError(String),
-
-    /// Internal Error
-    Error(String),
-}
-
-impl std::fmt::Display for PublishResult {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PublishResult::Acknowledged(packet_id) => {
-                write!(
-                    f,
-                    "Message acknowledged by broker (packet ID: {})",
-                    packet_id
-                )
-            }
-            PublishResult::Completed(packet_id) => {
-                write!(
-                    f,
-                    "Message transmission completed (packet ID: {})",
-                    packet_id
-                )
-            }
-            PublishResult::Sent(packet_id) => {
-                write!(
-                    f,
-                    "Message sent, no acknowledgment expected (packet ID: {})",
-                    packet_id
-                )
-            }
-            PublishResult::TimedOut => {
-                write!(f, "Message publish timed out")
-            }
-            PublishResult::SerializationError(msg) => {
-                write!(f, "Serialization failed: {}", msg)
-            }
-            PublishResult::Error(msg) => {
-                write!(f, "Publish error: {}", msg)
-            }
-        }
-    }
-}
-
 /// Completion signal for a published message
-type PublishCompletion = oneshot::Sender<PublishResult>;
+type PublishCompletion = oneshot::Sender<std::result::Result<MqttPublishSuccess, MqttError>>;
 
 /// Represents a publish waiting for acknowledgment
 #[derive(Debug)]
@@ -527,7 +461,7 @@ impl MqttierClient {
                             // If QoS is 0, immediately notify completion and continue without inserting into pending_publishes
                             if qos == QoS::AtMostOnce {
                                 if let Some(sender) = queued_message.completion.take() {
-                                    let _ = sender.send(PublishResult::Sent(packet_id));
+                                    let _ = sender.send(Ok(MqttPublishSuccess::Sent));
                                 }
                                 continue;
                             }
@@ -554,9 +488,7 @@ impl MqttierClient {
                                 topic
                             );
                             if let Some(sender) = queued_message.completion.take() {
-                                let _ = sender.send(PublishResult::Error(
-                                    "sent_queue receiver closed".to_string(),
-                                ));
+                                let _ = sender.send(Err(MqttError::Other("sent_queue receiver closed".to_string())));
                             }
                         }
                         Err(_) => {
@@ -566,7 +498,7 @@ impl MqttierClient {
                                 topic
                             );
                             if let Some(sender) = queued_message.completion.take() {
-                                let _ = sender.send(PublishResult::TimedOut);
+                                let _ = sender.send(Err(MqttError::TimeoutError("Timeout waiting for packet ID".to_string())));
                             }
                             continue;
                         }
@@ -575,7 +507,7 @@ impl MqttierClient {
                 Err(e) => {
                     error!("Failed to publish message to {}: {}", topic, e);
                     if let Some(sender) = queued_message.completion.take() {
-                        let _ = sender.send(PublishResult::Error(format!("{}", e)));
+                        let _ = sender.send(Err(MqttError::Other(format!("{}", e))));
                     }
                 }
             }
@@ -687,7 +619,7 @@ impl MqttierClient {
                                 if let Some(pending) = pending_map_guard.remove(&pkid_u16) {
                                     let puback_send_result = pending
                                         .completion
-                                        .send(PublishResult::Acknowledged(pkid_u16));
+                                        .send(Ok(MqttPublishSuccess::Acknowledged));
                                     debug!("Acknowledged PUBACK for packet ID: {} - {:?}", pkid_u16, puback_send_result);
                                 } else {
                                     error!("Couldn't get pending_publish channel for packet {}", pkid_u16);
@@ -714,7 +646,7 @@ impl MqttierClient {
                             if existing.qos == QoS::ExactlyOnce {
                                 if let Some(pending) = pending_map.remove(&pkid_u16) {
                                     let _ =
-                                        pending.completion.send(PublishResult::Completed(pkid_u16));
+                                        pending.completion.send(Ok(MqttPublishSuccess::Completed));
                                 } else {
                                     error!("Couldn't get pending_publish channel for packet {}", pkid_u16);
                                 }
@@ -930,7 +862,7 @@ impl MqttClient for MqttierClient {
 
     async fn publish(&mut self, message: MqttMessage) -> std::result::Result<MqttPublishSuccess, MqttError> {
         let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
-        let (completion_tx, completion_rx) = oneshot::channel::<PublishResult>();
+        let (completion_tx, completion_rx) = oneshot::channel::<std::result::Result<MqttPublishSuccess, MqttError>>();
 
         // If we have a publish queue, send through that.
         debug!(
@@ -950,32 +882,49 @@ impl MqttClient for MqttierClient {
                 // On error we get the message back so we can notify the original completion sender
                 let mut returned = e.0;
                 if let Some(sender) = returned.completion.take() {
-                    let _ = sender.send(PublishResult::Error("Channel send error".to_string()));
+                    let _ = sender.send(Err(MqttError::Other("Channel send error".to_string())));
                 }
             }
         }
         
         match tokio::time::timeout(Duration::from_millis(5000), completion_rx).await {
-            Ok(Ok(result)) => match result {
-                PublishResult::Acknowledged(_pkid) => {
-                    Ok(MqttPublishSuccess::Acknowledged)
-                }
-                PublishResult::Completed(_pkid) => {
-                    Ok(MqttPublishSuccess::Completed)
-                }
-                PublishResult::Sent(_pkid) => {
-                    Ok(MqttPublishSuccess::Sent)
-                }
-                PublishResult::TimedOut => Err(MqttError::TimeoutError("Publish timeout".to_string())),
-                PublishResult::SerializationError(msg) => Err(MqttError::PublishError(msg)),
-                PublishResult::Error(msg) => Err(MqttError::PublishError(msg)),
-            },
-            Ok(Err(_)) => Err(MqttError::PublishError("Channel receive error".to_string())),
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(MqttError::PublishError("Completion channel closed".to_string())),
             Err(_) => Err(MqttError::TimeoutError(format!("Publish completion timeout after 5000ms"))),
         }
     }
 
-    fn nowait_publish(&mut self, message: MqttMessage) -> std::result::Result<MqttPublishSuccess, MqttError> {
+    async fn publish_noblock(&mut self, message: MqttMessage) -> oneshot::Receiver<std::result::Result<MqttPublishSuccess, MqttError>> {
+        let _state = self.state.read().await; // keep to ensure we hold read access when checking connection if needed
+        let (completion_tx, completion_rx) = oneshot::channel::<std::result::Result<MqttPublishSuccess, MqttError>>();
+
+        // If we have a publish queue, send through that.
+        debug!(
+            "Sending message to publish queue for topic: {} with QoS: {:?}",
+            message.topic, message.qos
+        );
+        let topic = message.topic.clone();
+        let queued_message = QueuedMessage {
+            message,
+            completion: Some(completion_tx),
+        };
+        match self.publish_queue_tx.send(queued_message).await {
+            Ok(_) => {
+                debug!("Message to {} queued for publish", topic);
+            }
+            Err(e) => {
+                // On error we get the message back so we can notify the original completion sender
+                let mut returned = e.0;
+                if let Some(sender) = returned.completion.take() {
+                    let _ = sender.send(Err(MqttError::PublishError("Channel send error".to_string())));
+                }
+            }
+        }
+
+        completion_rx
+    }
+
+    fn publish_nowait(&mut self, message: MqttMessage) -> std::result::Result<MqttPublishSuccess, MqttError> {
         debug!(
             "Queueing message for fire-and-forget publish to topic: {} with QoS: {:?}",
             message.topic, message.qos
