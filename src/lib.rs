@@ -398,7 +398,7 @@ impl MqttierClient {
 
         while let Some(mut queued_message) = pub_state.publish_queue_rx.recv().await {
             MqttierClient::wait_for_connection(state.clone()).await;
-
+            
             let topic = queued_message.message.topic.clone();
             debug!("Publishing message to topic: {}", topic);
             
@@ -442,15 +442,17 @@ impl MqttierClient {
             match publish_result {
                 Ok(_) => {
                     // After a successful publish call, wait for the sent packet id from the sent queue receiver
-                    //let timeout_ms = {
-                    //    let ack_timeout_guard = pub_state.ack_timeout_ms.read().await;
-                    //    *ack_timeout_guard
-                    //};
-                    match tokio::time::timeout(
-                        Duration::from_millis(5000),
+                    let timeout_ms = {
+                        let ack_timeout_guard = pub_state.ack_timeout_ms.read().await;
+                        *ack_timeout_guard
+                    };
+                    debug!("Waiting for sent packet id with timeout");
+                    let sent_result = tokio::time::timeout(
+                        Duration::from_millis(timeout_ms),
                         pub_state.sent_queue_rx.recv(),
                     )
-                    .await
+                    .await;
+                    match sent_result
                     {
                         Ok(Some(packet_id)) => { // Another part of the code found the outgoing packet id and sent it here via sent_queue_rx.
                             debug!(
@@ -527,11 +529,11 @@ impl MqttierClient {
             debug!("Event loop polled");
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
-                    info!("CONNACK: Connected to MQTT broker");
 
                     {
                         let mut state_guard = state.write().await;
                         state_guard.is_connected = true;
+                        info!("CONNACK: Connected to MQTT broker");
                     }
 
                     // Update connection state
@@ -541,21 +543,29 @@ impl MqttierClient {
                     let s = state.clone();
                     let c = client.clone();
                     tokio::spawn(async move {
-                        let mut state_guard = s.write().await;
-                        for subscription in state_guard.queued_subscriptions.drain(..) {
-                            debug!(
-                                "Processing queued subscription for topic: {}",
-                                subscription.topic
-                            );
-                            if let Err(e) = c
-                                .subscribe_with_properties(
-                                    &subscription.topic,
-                                    subscription.qos,
-                                    subscription.props,
-                                )
-                                .await
-                            {
-                                error!("Failed to subscribe to {}: {}", subscription.topic, e);
+                        loop {
+                            let next_subscription = {
+                                let mut state_guard = s.write().await;
+                                state_guard.queued_subscriptions.pop()
+                            };
+                            if let Some(subscription) = next_subscription {
+                                debug!(
+                                    "Processing queued subscription for topic: {}",
+                                    subscription.topic
+                                );
+                                if let Err(e) = c
+                                    .subscribe_with_properties(
+                                        &subscription.topic,
+                                        subscription.qos,
+                                        subscription.props,
+                                    )
+                                    .await
+                                {
+                                    error!("Failed to subscribe to {}: {}", subscription.topic, e);
+                                }
+                            } else {
+                                debug!("Finished processing queued subscriptions");
+                                break;
                             }
                         }
                     });
