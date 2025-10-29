@@ -12,6 +12,9 @@ categories = ["network-programming", "asynchronous", "api-bindings"]
 documentation = "https://docs.rs/mqttier"
 homepage = "https://github.com/stinger-ipc/mqttier"
 
+[features]
+metrics = []
+
 [dependencies]
 rumqttc = "0.24"
 tokio = { version = "1.0", features = ["full"] }

@@ -2,6 +2,9 @@
 //!
 //! A Rust MQTT client library providing an abstracted interface around rumqttc.
 
+
+pub mod metrics;
+
 use async_trait::async_trait;
 use builder_pattern::Builder;
 use bytes::Bytes;
@@ -44,6 +47,8 @@ type PublishCompletion = oneshot::Sender<std::result::Result<MqttPublishSuccess,
 struct PendingPublish {
     qos: QoS,
     completion: PublishCompletion,
+    #[cfg(feature = "metrics")]
+    timestamp: std::time::Instant,
 }
 
 /// Represents a queued subscription
@@ -168,6 +173,9 @@ pub struct MqttierClient {
 
     /// MQTT connection options including LWT configuration
     mqtt_options: Arc<RwLock<MqttOptions>>,
+
+    /// Metrics collector (only contains data when the 'metrics' feature is enabled)
+    metrics: Arc<metrics::Metrics>,
 }
 
 impl MqttierClient {
@@ -234,6 +242,10 @@ impl MqttierClient {
             connection_state_tx,
             connection_state_rx,
             mqtt_options: Arc::new(RwLock::new(mqttoptions)),
+            #[cfg(feature = "metrics")]
+            metrics: Arc::new(metrics::Metrics::new()),
+            #[cfg(not(feature = "metrics"))]
+            metrics: Arc::new(metrics::Metrics{}), // No-op metrics when feature disabled
         })
     }
 
@@ -241,6 +253,23 @@ impl MqttierClient {
     fn next_subscription_id(&self) -> usize {
         self.next_subscription_id.fetch_add(1, Ordering::SeqCst)
     }
+
+    /// Get a snapshot of current metrics.
+    ///
+    /// This method is only available when the `metrics` feature is enabled.
+    #[cfg(feature = "metrics")]
+    pub fn get_metrics(&self) -> metrics::MetricsSnapshot {
+        self.metrics.snapshot()
+    }
+
+    /// Reset all metrics to zero.
+    ///
+    /// This method is only available when the `metrics` feature is enabled.
+    #[cfg(feature = "metrics")]
+    pub fn reset_metrics(&self) {
+        self.metrics.reset();
+    }
+
 
     /// Subscribe to a topic.
     ///
@@ -282,11 +311,27 @@ impl MqttierClient {
             2 => QoS::ExactlyOnce,
             _ => return Err(MqttierError::InvalidQos(qos)),
         };
+        
+        #[cfg(feature = "metrics")]
+        self.metrics.increment_subscription_requests();
+        
         if state.is_connected {
             debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
-            self.client
+            let result = self.client
                 .subscribe_with_properties(&topic, rumqttc_qos, subscription_props)
-                .await?;
+                .await;
+            
+            match result {
+                Ok(_) => {
+                    #[cfg(feature = "metrics")]
+                    self.metrics.increment_active_subscriptions();
+                },
+                Err(e) => {
+                    #[cfg(feature = "metrics")]
+                    self.metrics.increment_subscription_failures();
+                    return Err(e.into());
+                }
+            }
         } else {
             debug!(
                 "Queueing subscription for topic: {} with QoS: {:?}",
@@ -318,36 +363,47 @@ impl MqttierClient {
         let publish_state = self.publish_state.clone();
         let sent_queue_tx = self.sent_queue_tx.clone();
         let connection_state_tx = self.connection_state_tx.clone();
+        let metrics = self.metrics.clone(); // Empty object when 'metrics' feature disabled.
 
         // Start the publish loop
         let client_for_publish = client.clone();
         let state_for_publish = state.clone();
+        let metrics_for_publish = metrics.clone(); // Empty object when 'metrics' feature disabled.
+        
         tokio::spawn(async move {
-            Self::publish_loop(client_for_publish, state_for_publish, publish_state).await;
+            Self::publish_loop(client_for_publish, state_for_publish, publish_state, metrics_for_publish).await;
         });
 
         // Start the connection loop
         tokio::spawn(async move {
             loop {
                 info!("Starting MQTT connection loop");
+                
+                #[cfg(feature = "metrics")]
+                metrics.increment_connection_attempts();
 
                 // Take ownership of the eventloop
                 let mut eventloop_guard = eventloop.lock().await;
                 if let Some(mut el) = eventloop_guard.take() {
                     drop(eventloop_guard);
 
-                    match Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone(), connection_state_tx.clone())
-                        .await
-                    {
+                    let result = Self::handle_connection(&client, &mut el, &state, sent_queue_tx.clone(), connection_state_tx.clone(), metrics.clone())
+                        .await;
+                        
+                    match result {
                         Ok(_) => {
                             info!("MQTT connection loop ended normally");
                         }
                         Err(e) => {
                             error!("MQTT connection error: {}", e);
+                            #[cfg(feature = "metrics")]
+                            metrics.record_failed_connection();
                         }
                     }
                 } else {
                     error!("EventLoop not available");
+                    #[cfg(feature = "metrics")]
+                    metrics.record_failed_connection();
                     break;
                 }
 
@@ -356,12 +412,18 @@ impl MqttierClient {
                     let mut state_guard = state.write().await;
                     state_guard.is_connected = false;
                 }
+                
+                #[cfg(feature = "metrics")]
+                metrics.record_disconnection();
 
                 // Update connection state
                 let _ = connection_state_tx.send(MqttConnectionState::Disconnected);
 
                 // Wait before reconnecting
                 warn!("Reconnecting in 5 seconds...");
+                #[cfg(feature = "metrics")]
+                metrics.increment_reconnection_count();
+                
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
         });
@@ -390,6 +452,8 @@ impl MqttierClient {
         client: AsyncClient,
         state: Arc<RwLock<ClientState>>,
         publish_state: Arc<Mutex<PublishState>>,
+        #[allow(unused_variables)]
+        metrics: Arc<metrics::Metrics>, // Empty object when 'metrics' feature disabled.
     ) {
         debug!("Starting publish loop");
         // This should be the only publish loop, so we can lock the publish state here.
@@ -400,6 +464,8 @@ impl MqttierClient {
             MqttierClient::wait_for_connection(state.clone()).await;
             
             let topic = queued_message.message.topic.clone();
+            #[allow(unused_variables)]
+            let payload_size = queued_message.message.payload.len();
             debug!("Publishing message to topic: {}", topic);
             
             let qos = {
@@ -408,6 +474,13 @@ impl MqttierClient {
                     StingerQoS::AtLeastOnce => QoS::AtLeastOnce,
                     StingerQoS::ExactlyOnce => QoS::ExactlyOnce,
                 }
+            };
+            
+            #[allow(unused_variables)]
+            let qos_u8 = match qos {
+                QoS::AtMostOnce => 0,
+                QoS::AtLeastOnce => 1,
+                QoS::ExactlyOnce => 2,
             };
 
             let mut pub_props = PublishProperties::default();
@@ -462,6 +535,8 @@ impl MqttierClient {
 
                             // If QoS is 0, immediately notify completion and continue without inserting into pending_publishes
                             if qos == QoS::AtMostOnce {
+                                #[cfg(feature = "metrics")]
+                                metrics.record_message_published(qos_u8, payload_size);
                                 if let Some(sender) = queued_message.completion.take() {
                                     let _ = sender.send(Ok(MqttPublishSuccess::Sent));
                                 }
@@ -469,11 +544,15 @@ impl MqttierClient {
                             }
 
                             if let Some(sender) = queued_message.completion.take() {
+                                #[cfg(feature = "metrics")]
+                                metrics.increment_pending_publishes();
                                 pending_puback_map_guard.insert(
                                     packet_id,
                                     PendingPublish {
                                         qos: qos,
                                         completion: sender,
+                                        #[cfg(feature = "metrics")]
+                                        timestamp: std::time::Instant::now(),
                                     },
                                 );
                             } else {
@@ -489,6 +568,8 @@ impl MqttierClient {
                                 "sent_queue_rx closed unexpectedly; cannot correlate published message for topic: {}",
                                 topic
                             );
+                            #[cfg(feature = "metrics")]
+                            metrics.increment_publish_failures();
                             if let Some(sender) = queued_message.completion.take() {
                                 let _ = sender.send(Err(MqttError::Other("sent_queue receiver closed".to_string())));
                             }
@@ -499,6 +580,8 @@ impl MqttierClient {
                                 "Timed out waiting for sent packet id for topic: {}",
                                 topic
                             );
+                            #[cfg(feature = "metrics")]
+                            metrics.increment_publish_timeouts();
                             if let Some(sender) = queued_message.completion.take() {
                                 let _ = sender.send(Err(MqttError::TimeoutError("Timeout waiting for packet ID".to_string())));
                             }
@@ -508,6 +591,8 @@ impl MqttierClient {
                 }
                 Err(e) => {
                     error!("Failed to publish message to {}: {}", topic, e);
+                    #[cfg(feature = "metrics")]
+                    metrics.increment_publish_failures();
                     if let Some(sender) = queued_message.completion.take() {
                         let _ = sender.send(Err(MqttError::Other(format!("{}", e))));
                     }
@@ -524,6 +609,7 @@ impl MqttierClient {
         state: &Arc<RwLock<ClientState>>,
         sent_queue_tx: mpsc::Sender<u16>,
         connection_state_tx: watch::Sender<MqttConnectionState>,
+        metrics: Arc<metrics::Metrics>, // Empty object when 'metrics' feature disabled.
     ) -> Result<()> {
         loop {
             debug!("Event loop polled");
@@ -535,6 +621,8 @@ impl MqttierClient {
                         state_guard.is_connected = true;
                         info!("CONNACK: Connected to MQTT broker");
                     }
+                    #[cfg(feature = "metrics")]
+                    metrics.record_successful_connection();
 
                     // Update connection state
                     let _ = connection_state_tx.send(MqttConnectionState::Connected);
@@ -542,6 +630,8 @@ impl MqttierClient {
                     // Process queued subscriptions
                     let s = state.clone();
                     let c = client.clone();
+                    #[cfg(feature = "metrics")]
+                    let m = metrics.clone();
                     tokio::spawn(async move {
                         loop {
                             let next_subscription = {
@@ -553,6 +643,8 @@ impl MqttierClient {
                                     "Processing queued subscription for topic: {}",
                                     subscription.topic
                                 );
+                                #[cfg(feature = "metrics")]
+                                m.increment_subscription_requests();
                                 if let Err(e) = c
                                     .subscribe_with_properties(
                                         &subscription.topic,
@@ -562,6 +654,11 @@ impl MqttierClient {
                                     .await
                                 {
                                     error!("Failed to subscribe to {}: {}", subscription.topic, e);
+                                    #[cfg(feature = "metrics")]
+                                    m.increment_subscription_failures();
+                                } else {
+                                    #[cfg(feature = "metrics")]
+                                    m.increment_active_subscriptions();
                                 }
                             } else {
                                 debug!("Finished processing queued subscriptions");
@@ -579,6 +676,18 @@ impl MqttierClient {
                         let correlation_data = pub_props.correlation_data;
                         let response_topic = pub_props.response_topic;
                         let content_type = pub_props.content_type;
+                        
+                        #[cfg(feature = "metrics")]
+                        {
+                            let payload_size = publish.payload.len();
+                            let qos_u8 = match publish.qos {
+                                QoS::AtMostOnce => 0,
+                                QoS::AtLeastOnce => 1,
+                                QoS::ExactlyOnce => 2,
+                            };
+                            metrics.record_message_received(qos_u8, payload_size);
+                        }
+                        
                         for subscription_id in subscription_ids {
                             // Collect user properties into a HashMap (last value wins for duplicate keys)
                             let mut user_props_map: HashMap<String, String> = HashMap::new();
@@ -617,6 +726,8 @@ impl MqttierClient {
                     debug!("Received PUBACK for packet ID: {}.", puback.pkid);
                     let pkid_u16 = puback.pkid;
                     let pending_arc: Arc<Mutex<HashMap<u16, PendingPublish>>> = state.read().await.pending_publishes.clone();
+                    #[allow(unused_variables)]
+                    let m = metrics.clone();
                     
                     // Since PUBACK requires mutex to the 'pending_publishes' map, we span a task to handle it
                     // when the mutex is available so that we don't block the event loop.
@@ -627,6 +738,14 @@ impl MqttierClient {
                         if let Some(existing) = pending_map_guard.get(&pkid_u16) {
                             if existing.qos == QoS::AtLeastOnce {
                                 if let Some(pending) = pending_map_guard.remove(&pkid_u16) {
+                                    #[cfg(feature = "metrics")]
+                                    {
+                                        let latency_ms = pending.timestamp.elapsed().as_millis() as u64;
+                                        m.record_publish_latency(latency_ms);
+                                        m.decrement_pending_publishes();
+                                        m.record_message_published(1, 0); // QoS 1, size tracked earlier
+                                        m.increment_puback_received();
+                                    }
                                     let puback_send_result = pending
                                         .completion
                                         .send(Ok(MqttPublishSuccess::Acknowledged));
@@ -647,6 +766,8 @@ impl MqttierClient {
                     debug!("Received PUBCOMP for packet ID: {}", pubcomp.pkid);
                     let pkid_u16 = pubcomp.pkid;
                     let pending_arc: Arc<Mutex<HashMap<u16, PendingPublish>>> = state.read().await.pending_publishes.clone();
+                    #[allow(unused_variables)]
+                    let m = metrics.clone();
 
                     // Since PUBCOMP requires mutex to the 'pending_publishes' map, we span a task to handle it
                     // when the mutex is available so that we don't block the event loop.
@@ -655,6 +776,14 @@ impl MqttierClient {
                         if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::ExactlyOnce {
                                 if let Some(pending) = pending_map.remove(&pkid_u16) {
+                                    #[cfg(feature = "metrics")]
+                                    {
+                                        let latency_ms = pending.timestamp.elapsed().as_millis() as u64;
+                                        m.record_publish_latency(latency_ms);
+                                        m.decrement_pending_publishes();
+                                        m.record_message_published(2, 0); // QoS 2, size tracked earlier
+                                        m.increment_pubcomp_received();
+                                    }
                                     let _ =
                                         pending.completion.send(Ok(MqttPublishSuccess::Completed));
                                 } else {
@@ -689,6 +818,7 @@ impl MqttierClient {
             }
         }
     }
+
 }
 
 #[async_trait]
@@ -806,13 +936,27 @@ impl MqttClient for MqttierClient {
             user_properties: Vec::new(),
         };
 
+        #[cfg(feature = "metrics")]
+        self.metrics.increment_subscription_requests();
+
         if state.is_connected {
             debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
             drop(state); // Release the lock before await
-            self.client
+            let result = self.client
                 .subscribe_with_properties(&topic, rumqttc_qos, subscription_props)
-                .await
-                .map_err(|e| MqttError::SubscriptionError(format!("{}", e)))?;
+                .await;
+            
+            match result {
+                Ok(_) => {
+                    #[cfg(feature = "metrics")]
+                    self.metrics.increment_active_subscriptions();
+                },
+                Err(e) => {
+                    #[cfg(feature = "metrics")]
+                    self.metrics.increment_subscription_failures();
+                    return Err(MqttError::SubscriptionError(format!("{}", e)));
+                }
+            }
         } else {
             debug!(
                 "Queueing subscription for topic: {} with QoS: {:?}",
@@ -831,6 +975,10 @@ impl MqttClient for MqttierClient {
     async fn unsubscribe(&mut self, topic: String) -> std::result::Result<(), MqttError> {
         let mut state = self.state.write().await;
         
+        // Count how many subscriptions we're removing
+        #[cfg(feature = "metrics")]
+        let num_removed = state.topic_to_subscription_ids.get(&topic).map(|v| v.len()).unwrap_or(0);
+        
         // Remove all subscription IDs for this topic
         if let Some(subscription_ids) = state.topic_to_subscription_ids.remove(&topic) {
             for subscription_id in subscription_ids {
@@ -848,6 +996,11 @@ impl MqttClient for MqttierClient {
                 .unsubscribe(&topic)
                 .await
                 .map_err(|e| MqttError::UnsubscribeError(format!("{}", e)))?;
+        }
+        
+        #[cfg(feature = "metrics")]
+        for _ in 0..num_removed {
+            self.metrics.decrement_active_subscriptions();
         }
         
         Ok(())
@@ -1056,7 +1209,6 @@ mod tests {
 mod validation_tests {
     use super::*;
     use stinger_mqtt_trait::MqttClient;
-    use stinger_mqtt_trait::validation;
 
     /// Test that MqttierClient properly implements the MqttClient trait
     #[tokio::test]
