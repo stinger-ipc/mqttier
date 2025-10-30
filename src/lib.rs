@@ -6,7 +6,7 @@
 pub mod metrics;
 
 use async_trait::async_trait;
-use builder_pattern::Builder;
+use derive_builder::Builder;
 use bytes::Bytes;
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::{
@@ -128,15 +128,18 @@ impl Default for OnlineMessage {
 
 /// Options for configuring the MqttierClient.
 #[derive(Clone, Builder)]
+#[builder(setter(into))]
 pub struct MqttierOptions {
-    #[default(Connection::TcpLocalhost(1883))]
+    #[builder(default = "Connection::TcpLocalhost(1883)")]
     pub connection: Connection,
-    #[default_lazy(||Uuid::new_v4().to_string())]
+    #[builder(default = "Uuid::new_v4().to_string()")]
     pub client_id: String,
-    #[default(5000)]
+    #[builder(default = "5000")]
     pub ack_timeout_ms: u64,
-    #[default(60)]
+    #[builder(default = "60")]
     pub keepalive_secs: u16,
+    #[builder(default = "None")]
+    pub availability_helper: Option<stinger_mqtt_trait::available::AvailabilityHelper>,
 }
 
 /// MqttierClient provides an abstracted, Clone-able interface around `rumqttc`.
@@ -173,6 +176,9 @@ pub struct MqttierClient {
 
     /// MQTT connection options including LWT configuration
     mqtt_options: Arc<RwLock<MqttOptions>>,
+
+    /// Availability helper for Home Assistant integration
+    availability_helper: Arc<stinger_mqtt_trait::available::AvailabilityHelper>,
 
     /// Metrics collector
     #[cfg(feature = "metrics")]
@@ -231,7 +237,7 @@ impl MqttierClient {
         };
 
         Ok(Self {
-            client_id,
+            client_id: client_id.clone(),
             client,
             state: Arc::new(RwLock::new(initial_state)),
             next_subscription_id: Arc::new(AtomicUsize::new(5)),
@@ -243,6 +249,7 @@ impl MqttierClient {
             connection_state_tx,
             connection_state_rx,
             mqtt_options: Arc::new(RwLock::new(mqttoptions)),
+            availability_helper: Arc::new(mqttier_options.availability_helper.unwrap_or_else(||stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), client_id))),
             #[cfg(feature = "metrics")]
             metrics: Arc::new(metrics::Metrics::new()),
         })
@@ -1028,7 +1035,7 @@ impl Mqtt5PubSub for MqttierClient {
     }
 
     fn get_availability_helper(&mut self) -> stinger_mqtt_trait::available::AvailabilityHelper {
-        stinger_mqtt_trait::available::AvailabilityHelper::system_availability(self.client_id.clone())
+        (*self.availability_helper).clone()
     }
 }
 
@@ -1073,48 +1080,6 @@ impl MqttierClient {
             
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    }
-
-    /// Set the Last Will and Testament message for the MQTT connection.
-    ///
-    /// This message will be sent by the broker if the client disconnects unexpectedly.
-    pub fn set_last_will(&mut self, message: MqttMessage) {
-        // Convert MqttMessage to rumqttc's LastWill format and store in MqttOptions
-        let mqtt_options = self.mqtt_options.clone();
-        tokio::spawn(async move {
-            let mut opts_guard = mqtt_options.write().await;
-            
-            // Convert QoS
-            let qos = match message.qos {
-                StingerQoS::AtMostOnce => QoS::AtMostOnce,
-                StingerQoS::AtLeastOnce => QoS::AtLeastOnce,
-                StingerQoS::ExactlyOnce => QoS::ExactlyOnce,
-            };
-            
-            // Build LastWillProperties
-            let lwt_props = LastWillProperties {
-                delay_interval: None,
-                payload_format_indicator: None,
-                message_expiry_interval: None,
-                content_type: message.content_type.clone(),
-                response_topic: message.response_topic.clone(),
-                correlation_data: message.correlation_data.clone(),
-                user_properties: message.user_properties.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect(),
-            };
-            
-            // Create LastWill
-            let last_will = LastWill {
-                topic: Bytes::from(message.topic.into_bytes()),
-                message: message.payload.into(),
-                qos,
-                retain: message.retain,
-                properties: Some(lwt_props),
-            };
-            
-            opts_guard.set_last_will(last_will);
-        });
     }
 
     /// Disconnect from the MQTT broker.
@@ -1216,6 +1181,7 @@ mod tests {
             client_id: "test_client".to_string(),
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
+            availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string()),
         };
         let client = MqttierClient::new(options).unwrap();
         assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
@@ -1232,6 +1198,7 @@ mod tests {
             client_id: client_id,
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
+            availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string()),
         };
         let _client = MqttierClient::new(options).unwrap();
         // If we get here without panic, the test passes
@@ -1252,6 +1219,7 @@ mod validation_tests {
             client_id: "trait_test_client".to_string(),
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
+            availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string()),
         };
         
         let client = MqttierClient::new(options).expect("Failed to create client");

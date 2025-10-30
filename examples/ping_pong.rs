@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id: "ping_pong_client".to_string(),
         ack_timeout_ms: 5000,
         keepalive_secs: 60,
+        availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "ping_pong".to_string()),
     };
     
     let mut client = MqttierClient::new(options)?;
