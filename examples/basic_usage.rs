@@ -1,5 +1,5 @@
 use mqttier::{MqttierClient, MqttierOptions, Connection};
-use stinger_mqtt_trait::MqttClient;
+use stinger_mqtt_trait::Mqtt5PubSub;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};

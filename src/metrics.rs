@@ -3,13 +3,10 @@
 //! This module provides comprehensive metrics tracking for MQTT operations when the
 //! `metrics` feature is enabled. All metrics use atomic operations for thread-safe updates.
 
-#[allow(unused_imports)]
 use std::sync::atomic::{AtomicU64, AtomicU32, AtomicBool, Ordering};
-#[allow(unused_imports)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Snapshot of metrics at a point in time
-#[cfg(feature = "metrics")]
 #[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     // Connection metrics
@@ -52,12 +49,6 @@ pub struct MetricsSnapshot {
     pub subscription_failures: u64,
 }
 
-/// When the `metrics` feature is disabled, provide a no-op MetricsSnapshot struct.  This allows for it to be provided in method definitions so that we don't have to duplicate method code.
-#[cfg(not(feature = "metrics"))]
-#[derive(Debug, Clone, Default)]
-pub struct MetricsSnapshot;
-
-#[cfg(feature = "metrics")]
 impl MetricsSnapshot {
     /// Get total messages published across all QoS levels
     pub fn total_messages_published(&self) -> u64 {
@@ -117,7 +108,6 @@ impl MetricsSnapshot {
 
 /// Metrics collector for MQTTier client operations
 #[derive(Debug, Default)]
-#[cfg(feature = "metrics")]
 pub struct Metrics {
     // Connection metrics
     connection_attempts: AtomicU64,
@@ -160,12 +150,6 @@ pub struct Metrics {
     subscription_failures: AtomicU64,
 }
 
-/// When the `metrics` feature is disabled, provide a no-op Metrics struct.  This allows for it to be provided in method definitions so that we don't have to duplicate method code.
-#[derive(Debug, Default)]
-#[cfg(not(feature = "metrics"))]
-pub struct Metrics;
-
-#[cfg(feature = "metrics")]
 impl Metrics {
     /// Create a new Metrics instance
     pub fn new() -> Self {
@@ -407,7 +391,6 @@ impl Metrics {
     }
 }
 
-#[cfg(feature = "metrics")]
 #[cfg(test)]
 mod tests {
     use super::*;

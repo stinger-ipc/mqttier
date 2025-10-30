@@ -7,7 +7,6 @@
 //! ```
 
 use mqttier::{MqttierClient, MqttierOptions, Connection};
-use stinger_mqtt_trait::MqttClient;
 use tokio::time::{sleep, Duration};
 use tracing_subscriber;
 
