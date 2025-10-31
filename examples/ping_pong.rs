@@ -67,25 +67,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id: "ping_pong_client".to_string(),
         ack_timeout_ms: 5000,
         keepalive_secs: 60,
-        availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "ping_pong".to_string()),
+        session_expiry_interval_secs: 1200,
+        availability_helper: Some(stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), "ping_pong".to_string())),
+        publish_queue_size: 128,
     };
     
     let mut client = MqttierClient::new(options)?;
-    
-    // Set up Last Will and Testament (LWT)
-    // This message will be published by the broker if the client disconnects unexpectedly
-    let client_id = client.get_client_id();
-    let lwt_topic = format!("client/{}/online", client_id);
-    let lwt_message = MqttMessageBuilder::default()
-        .topic(&lwt_topic)
-        .payload(Bytes::from("{\"state\":\"offline\"}"))
-        .qos(QoS::AtLeastOnce)
-        .retain(true)
-        .content_type(Some("application/json".to_string()))
-        .user_properties(HashMap::new())
-        .build()
-        .unwrap();
-    client.set_last_will(lwt_message);
 
     // Create a broadcast channel for receiving pong messages
     let (pong_tx, mut pong_rx) = broadcast::channel::<MqttMessage>(32);
@@ -102,24 +89,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Wait a moment for connection to establish
     sleep(Duration::from_millis(500)).await;
-
-
-    println!("Publishing online status...");
-    // Publish the "online" message to the same topic as the LWT
-    let online_message = MqttMessageBuilder::default()
-        .topic(&lwt_topic)
-        .payload(Bytes::from("{\"state\":\"online\"}"))
-        .qos(QoS::AtLeastOnce)
-        .retain(true)
-        .content_type(Some("application/json".to_string()))
-        .user_properties(HashMap::new())
-        .build()
-        .unwrap();
-
-    match client.publish(online_message).await {
-        Ok(result) => println!("Published online status: {:?}", result),
-        Err(e) => println!("Failed to publish online status: {:?}", e),
-    }
 
     // Spawn a task to handle incoming pong messages
     println!("Spawning pong handler ...");
@@ -169,22 +138,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Give some time for any remaining pongs to arrive
     sleep(Duration::from_secs(2)).await;
-
-    // Publish offline status before exiting (graceful shutdown)
-    let offline_message = MqttMessageBuilder::default()
-        .topic(&lwt_topic)
-        .payload(Bytes::from("{\"state\":\"offline\"}"))
-        .qos(QoS::AtLeastOnce)
-        .retain(true)
-        .content_type(Some("application/json".to_string()))
-        .user_properties(HashMap::new())
-        .build()
-        .unwrap();
-
-    match client.publish(offline_message).await {
-        Ok(result) => println!("Published offline status: {:?}", result),
-        Err(e) => println!("Failed to publish offline status: {:?}", e),
-    }
 
     // Cancel the pong handler
     pong_handler.abort();

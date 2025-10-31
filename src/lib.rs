@@ -10,7 +10,7 @@ use derive_builder::Builder;
 use bytes::Bytes;
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::mqttbytes::v5::{
-    LastWill, LastWillProperties, Packet, PublishProperties, SubscribeProperties,
+    LastWill, Packet, PublishProperties, SubscribeProperties,
 };
 use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
 use std::collections::HashMap;
@@ -106,26 +106,6 @@ pub enum Connection {
     Tcp(TcpConnection), // Specify hostname and port.
 }
 
-/// Specifies messages to sent to a topic when the connection goes online or offline.
-#[derive(Clone)]
-pub struct OnlineMessage {
-    pub topic: Option<Bytes>,
-    pub content_type: Option<String>,
-    pub online: Option<Bytes>,
-    pub offline: Option<Bytes>,
-}
-
-impl Default for OnlineMessage {
-    fn default() -> Self {
-        OnlineMessage {
-            topic: None,
-            content_type: Some("application/json".to_string()),
-            online: Some(Bytes::from("{\"state\":\"online\"}")),
-            offline: Some(Bytes::from("{\"state\":\"offline\"}")),
-        }
-    }
-}
-
 /// Options for configuring the MqttierClient.
 #[derive(Clone, Builder)]
 #[builder(setter(into))]
@@ -138,8 +118,12 @@ pub struct MqttierOptions {
     pub ack_timeout_ms: u64,
     #[builder(default = "60")]
     pub keepalive_secs: u16,
+    #[builder(default = "1200")]
+    pub session_expiry_interval_secs: u16,
     #[builder(default = "None")]
-    pub availability_helper: Option<stinger_mqtt_trait::available::AvailabilityHelper>,
+    pub availability_helper: Option<stinger_mqtt_trait::availability::AvailabilityHelper>,
+    #[builder(default = "128")]
+    pub publish_queue_size: u16,
 }
 
 /// MqttierClient provides an abstracted, Clone-able interface around `rumqttc`.
@@ -174,11 +158,11 @@ pub struct MqttierClient {
     /// Connection state receiver for monitoring connection state
     connection_state_rx: watch::Receiver<MqttConnectionState>,
 
-    /// MQTT connection options including LWT configuration
+    /// MQTT connection options
     mqtt_options: Arc<RwLock<MqttOptions>>,
 
     /// Availability helper for Home Assistant integration
-    availability_helper: Arc<stinger_mqtt_trait::available::AvailabilityHelper>,
+    availability_helper: Arc<stinger_mqtt_trait::availability::AvailabilityHelper>,
 
     /// Metrics collector
     #[cfg(feature = "metrics")]
@@ -197,8 +181,8 @@ impl MqttierClient {
         let client_id = mqttier_options.client_id;
 
         // Create the sent queue channels (u16 packet ids)
-        let (sent_queue_tx, sent_queue_rx) = mpsc::channel::<u16>(5);
-        let (publish_queue_tx, publish_queue_rx) = mpsc::channel::<QueuedMessage>(100);
+        let (sent_queue_tx, sent_queue_rx) = mpsc::channel::<u16>(mqttier_options.publish_queue_size as usize);
+        let (publish_queue_tx, publish_queue_rx) = mpsc::channel::<QueuedMessage>(mqttier_options.publish_queue_size as usize);
 
         let initial_publish_state = PublishState {
             publish_queue_rx,
@@ -222,6 +206,22 @@ impl MqttierClient {
         if let Connection::UnixSocket(_socket_path) = mqttier_options.connection {
             mqttoptions.set_transport(rumqttc::Transport::Unix);
         }
+
+        
+        let availability_helper = mqttier_options.availability_helper.unwrap_or_else(||stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), client_id.clone()));
+        let mut availability_helper_clone = availability_helper.clone();
+        let will_payload_bytes: Vec<u8> = match availability_helper_clone.get_message(false) {
+            Ok(msg) => msg.payload.to_vec(),
+            Err(_) => b"".to_vec(),
+        };
+        let will = LastWill::new(
+            availability_helper.get_topic(),
+            Bytes::from(will_payload_bytes),
+            QoS::AtLeastOnce,
+            true,
+            None,
+        );
+        mqttoptions.set_last_will(will);
 
         let (client, eventloop) = AsyncClient::new(mqttoptions.clone(), 10);
 
@@ -249,7 +249,7 @@ impl MqttierClient {
             connection_state_tx,
             connection_state_rx,
             mqtt_options: Arc::new(RwLock::new(mqttoptions)),
-            availability_helper: Arc::new(mqttier_options.availability_helper.unwrap_or_else(||stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), client_id))),
+            availability_helper: Arc::new(availability_helper),
             #[cfg(feature = "metrics")]
             metrics: Arc::new(metrics::Metrics::new()),
         })
@@ -469,7 +469,7 @@ impl MqttierClient {
         }
     }
 
-    /// Handle the publish loop - processes queued messages and waits for acknowledgments
+    /// Handle the publish loop - processes queued messages and waits for acknowledgments.
     async fn publish_loop(
         client: AsyncClient,
         state: Arc<RwLock<ClientState>>,
@@ -624,7 +624,7 @@ impl MqttierClient {
         }
     }
 
-    /// Handle a single MQTT connection
+    /// Handle a single MQTT connection.  Receives incoming packets and dispatches them to the appropriate broadcast channels.
     async fn handle_connection(
         client: &AsyncClient,
         eventloop: &mut EventLoop,
@@ -635,7 +635,6 @@ impl MqttierClient {
         metrics: Arc<metrics::Metrics>,
     ) -> Result<()> {
         loop {
-            debug!("Event loop polled");
             match eventloop.poll().await {
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
 
@@ -1034,7 +1033,7 @@ impl Mqtt5PubSub for MqttierClient {
         Ok(MqttPublishSuccess::Sent)
     }
 
-    fn get_availability_helper(&mut self) -> stinger_mqtt_trait::available::AvailabilityHelper {
+    fn get_availability_helper(&mut self) -> stinger_mqtt_trait::availability::AvailabilityHelper {
         (*self.availability_helper).clone()
     }
 }
@@ -1077,8 +1076,6 @@ impl MqttierClient {
             if start_time.elapsed() > timeout_duration {
                 return Err(Mqtt5PubSubError::TimeoutError("Connection timeout".to_string()));
             }
-            
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -1181,7 +1178,9 @@ mod tests {
             client_id: "test_client".to_string(),
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
-            availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string()),
+            session_expiry_interval_secs: 1200,
+            availability_helper: Some(stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string())),
+            publish_queue_size: 128,
         };
         let client = MqttierClient::new(options).unwrap();
         assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
@@ -1198,7 +1197,9 @@ mod tests {
             client_id: client_id,
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
-            availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string()),
+            session_expiry_interval_secs: 1200,
+            availability_helper: Some(stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string())),
+            publish_queue_size: 128,
         };
         let _client = MqttierClient::new(options).unwrap();
         // If we get here without panic, the test passes
@@ -1219,7 +1220,9 @@ mod validation_tests {
             client_id: "trait_test_client".to_string(),
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
-            availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string()),
+            session_expiry_interval_secs: 1200,
+            availability_helper: Some(stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), "test_system".to_string())),
+            publish_queue_size: 128,
         };
         
         let client = MqttierClient::new(options).expect("Failed to create client");

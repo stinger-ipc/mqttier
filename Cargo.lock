@@ -714,9 +714,9 @@ dependencies = [
 
 [[package]]
 name = "stinger-mqtt-trait"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4e9c4f8bd59973f44e42e1f6f2aaa86042ef2da3367797a2c5102794b642fde"
+checksum = "67261245749464d1b2734a76c1901f7250a4f6a87bb43b7f567df3857bdcb440"
 dependencies = [
  "async-trait",
  "bytes",

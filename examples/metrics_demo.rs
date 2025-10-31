@@ -7,7 +7,6 @@
 //! ```
 
 use mqttier::{MqttierClient, MqttierOptions, Connection};
-use stinger_mqtt_trait::Mqtt5PubSub;
 use tokio::time::{sleep, Duration};
 use tracing_subscriber;
 
@@ -22,7 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         client_id: "metrics_demo_client".to_string(),
         ack_timeout_ms: 5000,
         keepalive_secs: 60,
-        availability_helper: stinger_mqtt_trait::available::AvailabilityHelper::client_availability("local".to_string(), "metrics_demo".to_string()),
+        session_expiry_interval_secs: 1200,
+        availability_helper: Some(stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), "metrics_demo".to_string())),
+        publish_queue_size: 128,
     };
 
     // Create the MQTT client
