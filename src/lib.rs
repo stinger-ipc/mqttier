@@ -385,7 +385,8 @@ impl MqttierClient {
                 publish_state,
                 #[cfg(feature = "metrics")]
                 metrics_for_publish
-        ).await;
+            ).await;
+            error!("Publish loop has exited unexpectedly");
         });
 
         // Start the connection loop
@@ -450,6 +451,15 @@ impl MqttierClient {
             }
         });
 
+        let this_client = self.clone();
+        tokio::spawn(async move{
+            stinger_mqtt_trait::availability::publish_online_availability_periodically(
+                this_client,
+                300,
+            ).await;
+            ()
+        });
+
         Ok(())
     }
 
@@ -467,6 +477,7 @@ impl MqttierClient {
             i = i + 1;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        debug!("MQTT connection established");
     }
 
     /// Handle the publish loop - processes queued messages and waits for acknowledgments.

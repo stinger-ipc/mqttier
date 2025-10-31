@@ -52,9 +52,11 @@ use std::collections::HashMap;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize tracing to stdout
+    // Initialize tracing to stdout with thread IDs and targets
     tracing_subscriber::fmt()
         .with_writer(std::io::stdout)
+        .with_thread_ids(true)      // Show thread ID
+        .with_target(true)           // Show module target
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive(tracing::Level::DEBUG.into()),
@@ -87,22 +89,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Starting MQTT client...");
     client.start().await?;
 
-    // Wait a moment for connection to establish
-    sleep(Duration::from_millis(500)).await;
-
     // Spawn a task to handle incoming pong messages
     println!("Spawning pong handler ...");
-    let pong_handler = tokio::spawn(async move {
-        while let Ok(message) = pong_rx.recv().await {
-            let payload_str = String::from_utf8_lossy(&message.payload);
-            println!("🏓 Received PONG: {}", payload_str);
-        }
-    });
+    let pong_handler = tokio::spawn(
+        tracing::info_span!("pong_handler").in_scope(|| async move {
+            while let Ok(message) = pong_rx.recv().await {
+                let payload_str = String::from_utf8_lossy(&message.payload);
+                println!("🏓 Received PONG: {}", payload_str);
+            }
+        })
+    );
 
     // Spawn a task to publish ping messages
     println!("Spawning ping publisher.  Will publish ping message very 3 seconds (10 messages total) ...");
     let mut ping_client = client.clone();
-    let pubtask = tokio::spawn(async move {
+    let pubtask = tokio::spawn(
+        tracing::info_span!("ping_publisher").in_scope(|| async move {
         for i in 1..=10 {
             let ping_message_payload = format!("{{\"ping\":{},\"timestamp\":{}}}", 
                 i, 
@@ -131,7 +133,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Wait before sending next ping
             sleep(Duration::from_secs(3)).await;
         }
-    });
+        })
+    );
 
     // Wait for the ping task to complete
     pubtask.await?;
@@ -143,6 +146,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     pong_handler.abort();
 
     println!("Example completed!");
+
+    #[cfg(feature = "metrics")]
+    {
+        let metrics = client.get_metrics();
+        println!("\n=== Final Metrics ===");
+        
+        // Connection metrics
+        println!("\n📡 Connection:");
+        println!("  Connection attempts: {}", metrics.connection_attempts);
+        println!("  Successful connections: {}", metrics.successful_connections);
+        println!("  Failed connections: {}", metrics.failed_connections);
+        println!("  Reconnection count: {}", metrics.reconnection_count);
+        println!("  Is connected: {}", metrics.is_connected);
+        if let Some(uptime) = metrics.connection_uptime_ms() {
+            println!("  Uptime: {} ms ({:.2} seconds)", uptime, uptime as f64 / 1000.0);
+        }
+        
+        // Publish metrics
+        println!("\n📤 Publishing:");
+        println!("  Total published: {}", metrics.total_messages_published());
+        println!("    - QoS 0: {}", metrics.messages_published_qos0);
+        println!("    - QoS 1: {}", metrics.messages_published_qos1);
+        println!("    - QoS 2: {}", metrics.messages_published_qos2);
+        println!("  Failed: {}", metrics.publish_failures);
+        println!("  Timeouts: {}", metrics.publish_timeouts);
+        if let Some(rate) = metrics.publish_success_rate() {
+            println!("  Success rate: {:.2}%", rate * 100.0);
+        }
+        println!("  Total bytes sent: {}", metrics.total_bytes_sent);
+        if let Some(avg_size) = metrics.avg_sent_message_size() {
+            println!("  Avg message size: {} bytes", avg_size);
+        }
+        
+        // Receive metrics
+        println!("\n📥 Receiving:");
+        println!("  Total received: {}", metrics.total_messages_received());
+        println!("    - QoS 0: {}", metrics.messages_received_qos0);
+        println!("    - QoS 1: {}", metrics.messages_received_qos1);
+        println!("    - QoS 2: {}", metrics.messages_received_qos2);
+        println!("  Total bytes received: {}", metrics.total_bytes_received);
+        if let Some(avg_size) = metrics.avg_received_message_size() {
+            println!("  Avg message size: {} bytes", avg_size);
+        }
+        
+        // Subscription metrics
+        println!("\n� Subscriptions:");
+        println!("  Active subscriptions: {}", metrics.active_subscriptions);
+        println!("  Subscription requests: {}", metrics.subscription_requests);
+        println!("  Subscription failures: {}", metrics.subscription_failures);
+        
+        // Reliability metrics
+        println!("\n✅ Reliability:");
+        println!("  PUBACK received: {}", metrics.puback_received);
+        println!("  PUBCOMP received: {}", metrics.pubcomp_received);
+        
+        // Performance metrics
+        println!("\n⚡ Performance:");
+        println!("  Avg publish latency: {} ms", metrics.avg_publish_latency_ms);
+        println!("  Min publish latency: {} ms", metrics.min_publish_latency_ms);
+        println!("  Max publish latency: {} ms", metrics.max_publish_latency_ms);
+        println!("  Pending publishes: {}", metrics.pending_publish_count);
+    }
 
     Ok(())
 }
