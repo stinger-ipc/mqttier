@@ -1043,9 +1043,9 @@ impl MqttierClient {
     /// Connect to the MQTT broker and establish a connection.
     ///
     /// Note: MqttierClient is designed to connect at construction time with connection
-    /// details specified in MqttierOptions. The URI parameter is currently ignored.
+    /// details specified in MqttierOptions.
     /// To properly support dynamic connection URIs would require significant refactoring.
-    pub async fn connect(&mut self, _uri: String) -> std::result::Result<(), Mqtt5PubSubError> {
+    pub async fn connect(&mut self) -> std::result::Result<(), Mqtt5PubSubError> {
         // Start the run loop if not already running
         let is_running = {
             let guard = self.is_running.lock().await;
