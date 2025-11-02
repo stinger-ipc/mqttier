@@ -1,10 +1,10 @@
-use mqttier::{MqttierClient, MqttierOptions, Connection};
-use stinger_mqtt_trait::Mqtt5PubSub;
-use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS};
 use bytes::Bytes;
+use mqttier::{Connection, MqttierClient, MqttierOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
+use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS};
+use stinger_mqtt_trait::Mqtt5PubSub;
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
@@ -30,7 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ack_timeout_ms: 5000,
         keepalive_secs: 60,
         session_expiry_interval_secs: 1200,
-    availability_helper: Some(stinger_mqtt_trait::availability::AvailabilityHelper::client_availability("local".to_string(), "basic_usage".to_string())),
+        availability_helper: Some(
+            stinger_mqtt_trait::availability::AvailabilityHelper::client_availability(
+                "local".to_string(),
+                "basic_usage".to_string(),
+            ),
+        ),
         publish_queue_size: 128,
     };
     let mut client = MqttierClient::new(options)?;
