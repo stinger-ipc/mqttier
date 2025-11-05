@@ -1330,3 +1330,32 @@ mod validation_tests {
         assert_eq!(current_state, MqttConnectionState::Disconnected);
     }
 }
+
+#[cfg(test)]
+mod builder_tests {
+    use super::*;
+
+    #[test]
+    fn test_mqttier_options_builder_defaults_and_override() {
+        // Use the generated builder to create options, overriding a couple fields
+        let opts = MqttierOptionsBuilder::default()
+            .client_id("builder_test_client")
+            .ack_timeout_ms(1234u64)
+            .publish_queue_size(64u16)
+            .build()
+            .expect("Failed to build MqttierOptions");
+
+        // Verify overridden values
+        assert_eq!(opts.client_id, "builder_test_client");
+        assert_eq!(opts.ack_timeout_ms, 1234);
+        assert_eq!(opts.publish_queue_size, 64);
+
+        // Verify defaults are populated for fields we didn't override
+        match opts.connection {
+            Connection::TcpLocalhost(port) => assert_eq!(port, 1883),
+            _ => panic!("Unexpected default connection type"),
+        }
+        assert_eq!(opts.keepalive_secs, 60);
+        assert_eq!(opts.session_expiry_interval_secs, 1200);
+    }
+}
