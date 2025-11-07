@@ -9,7 +9,6 @@
 use mqttier::{Connection, MqttierClient, MqttierOptions};
 use stinger_mqtt_trait::Mqtt5PubSub;
 use tokio::time::{sleep, Duration};
-use tracing_subscriber;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

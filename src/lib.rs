@@ -164,8 +164,6 @@ pub struct MqttierClient {
     /// Connection state receiver for monitoring connection state
     connection_state_rx: watch::Receiver<MqttConnectionState>,
 
-    /// MQTT connection options
-    mqtt_options: Arc<RwLock<MqttOptions>>,
 
     /// Availability helper for Home Assistant integration
     availability_helper: Arc<stinger_mqtt_trait::availability::AvailabilityHelper>,
@@ -257,7 +255,7 @@ impl MqttierClient {
             publish_state: Arc::new(Mutex::new(initial_publish_state)),
             connection_state_tx,
             connection_state_rx,
-            mqtt_options: Arc::new(RwLock::new(mqttoptions)),
+
             availability_helper: Arc::new(availability_helper),
             #[cfg(feature = "metrics")]
             metrics: Arc::new(metrics::Metrics::new()),
@@ -472,7 +470,6 @@ impl MqttierClient {
                 300,
             )
             .await;
-            ()
         });
 
         Ok(())
@@ -535,12 +532,15 @@ impl MqttierClient {
             if let Some(corr_data) = queued_message.message.correlation_data {
                 pub_props.correlation_data = Some(corr_data.clone());
             }
-            if queued_message.message.user_properties.len() > 0 {
+            if !queued_message.message.user_properties.is_empty() {
                 let mut user_props_vec: Vec<(String, String)> = Vec::new();
                 for (k, v) in queued_message.message.user_properties.iter() {
                     user_props_vec.push((k.clone(), v.clone()));
                 }
                 pub_props.user_properties = user_props_vec;
+            }
+            if queued_message.message.content_type.is_some() {
+                pub_props.content_type = queued_message.message.content_type.clone();
             }
 
             // We lock this mutex here before publishing.  This prevents processing of the puback until we can insert into the pending_publishes map.
@@ -588,7 +588,7 @@ impl MqttierClient {
                                 pending_puback_map_guard.insert(
                                     packet_id,
                                     PendingPublish {
-                                        qos: qos,
+                                        qos,
                                         completion: sender,
                                         #[cfg(feature = "metrics")]
                                         timestamp: queued_message.start_timestamp,
@@ -643,12 +643,13 @@ impl MqttierClient {
     }
 
     /// Handle a single MQTT connection.  Receives incoming packets and dispatches them to the appropriate broadcast channels.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         client: &AsyncClient,
         eventloop: &mut EventLoop,
         is_connected: Arc<RwLock<bool>>,
         subscriptions: Arc<Mutex<HashMap<usize, broadcast::Sender<MqttMessage>>>>,
-        topic_to_subscription_ids: Arc<Mutex<HashMap<String, Vec<usize>>>>,
+        _topic_to_subscription_ids: Arc<Mutex<HashMap<String, Vec<usize>>>>,
         queued_subscriptions: Arc<Mutex<Vec<QueuedSubscription>>>,
         pending_publishes_map: Arc<Mutex<HashMap<u16, PendingPublish>>>,
         sent_queue_tx: mpsc::Sender<u16>,
@@ -757,7 +758,7 @@ impl MqttierClient {
                                 .unwrap();
                             let subs_guard = subscriptions.lock().await;
                             if let Some(sender) = subs_guard.get(&subscription_id) {
-                                if let Err(_) = sender.send(message.clone()) {
+                                if sender.send(message.clone()).is_err() {
                                     warn!(
                                         "Failed to send message to subscription {}",
                                         subscription_id
@@ -776,7 +777,7 @@ impl MqttierClient {
 
                     // Since PUBACK requires mutex to the 'pending_publishes' map, we span a task to handle it
                     // when the mutex is available so that we don't block the event loop.
-                    let _ = tokio::spawn(async move {
+                    tokio::spawn(async move {
                         debug!("Processing PUBACK for packet ID: {}", pkid_u16);
                         let mut pending_map_guard = pending_arc.lock().await;
 
@@ -824,7 +825,7 @@ impl MqttierClient {
 
                     // Since PUBCOMP requires mutex to the 'pending_publishes' map, we span a task to handle it
                     // when the mutex is available so that we don't block the event loop.
-                    let _ = tokio::spawn(async move {
+                    tokio::spawn(async move {
                         let mut pending_map = pending_arc.lock().await;
                         if let Some(existing) = pending_map.get(&pkid_u16) {
                             if existing.qos == QoS::ExactlyOnce {
@@ -1032,9 +1033,9 @@ impl Mqtt5PubSub for MqttierClient {
             Ok(Err(_)) => Err(Mqtt5PubSubError::PublishError(
                 "Completion channel closed".to_string(),
             )),
-            Err(_) => Err(Mqtt5PubSubError::TimeoutError(format!(
-                "Publish completion timeout after 50000ms"
-            ))),
+            Err(_) => Err(Mqtt5PubSubError::TimeoutError(
+                "Publish completion timeout after 50000ms".to_string()
+            )),
         }
     }
 
@@ -1137,8 +1138,8 @@ impl MqttierClient {
         let start_time = std::time::Instant::now();
 
         loop {
-            if let Ok(_) = state_rx.changed().await {
-                let state = state_rx.borrow().clone();
+            if (state_rx.changed().await).is_ok() {
+                let state = *state_rx.borrow();
                 if matches!(state, MqttConnectionState::Connected) {
                     return Ok(());
                 }
@@ -1278,7 +1279,7 @@ mod tests {
                 hostname: "localhost".to_string(),
                 port: 1883,
             }),
-            client_id: client_id,
+            client_id,
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
             session_expiry_interval_secs: 1200,
