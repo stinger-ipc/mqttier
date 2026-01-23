@@ -435,6 +435,10 @@ impl MqttierClient {
                             metrics.record_failed_connection();
                         }
                     }
+
+                    // Put the event loop back into the mutex for the next connection attempt
+                    let mut eventloop_guard = eventloop.lock().await;
+                    *eventloop_guard = Some(el);
                 } else {
                     error!("EventLoop not available");
                     #[cfg(feature = "metrics")]
@@ -487,7 +491,7 @@ impl MqttierClient {
             i += 1;
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        debug!("MQTT connection established");
+        debug!("MQTT connection good.");
     }
 
     /// Handle the publish loop - processes queued messages and waits for acknowledgments.
@@ -758,10 +762,11 @@ impl MqttierClient {
                                 .unwrap();
                             let subs_guard = subscriptions.lock().await;
                             if let Some(sender) = subs_guard.get(&subscription_id) {
-                                if sender.send(message.clone()).is_err() {
+                                let send_result = sender.send(message.clone());
+                                if let Err(e) = send_result {
                                     warn!(
-                                        "Failed to send message to subscription {}",
-                                        subscription_id
+                                        "Failed to send message to subscription {}: {}",
+                                        subscription_id, e
                                     );
                                 }
                             }
