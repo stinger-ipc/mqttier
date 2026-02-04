@@ -11,7 +11,7 @@ use derive_builder::Builder;
 use rumqttc::v5::mqttbytes::v5::{LastWill, Packet, PublishProperties, SubscribeProperties};
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -113,7 +113,9 @@ pub struct MqttierOptions {
     #[builder(default = "None")]
     pub availability_helper: Option<stinger_mqtt_trait::availability::AvailabilityHelper>,
     #[builder(default = "128")]
-    pub publish_queue_size: u16,
+    pub publish_queue_size: u16, // Size of the publish queue in number of messages.
+    #[builder(default = "(10 * 1024)")]
+    pub max_incoming_packet_size: u32,
 }
 
 /// MqttierClient provides an abstracted, Clone-able interface around `rumqttc`.
@@ -208,6 +210,7 @@ impl MqttierClient {
         let mut mqttoptions = MqttOptions::new(client_id.clone(), hostname, port);
         mqttoptions.set_keep_alive(Duration::from_secs(mqttier_options.keepalive_secs as u64));
         mqttoptions.set_clean_start(true);
+        mqttoptions.set_max_packet_size(Some(mqttier_options.max_incoming_packet_size));
 
         if let Connection::UnixSocket(_socket_path) = mqttier_options.connection {
             mqttoptions.set_transport(rumqttc::Transport::Unix);
@@ -399,6 +402,10 @@ impl MqttierClient {
 
         // Start the connection loop
         tokio::spawn(async move {
+            // Track recent packet IDs to prevent sending duplicates after reconnection
+            // This must persist across reconnections, so it's created outside the loop
+            let mut recent_pkids: VecDeque<u16> = VecDeque::with_capacity(8);
+
             loop {
                 info!("Starting MQTT connection loop");
 
@@ -420,6 +427,7 @@ impl MqttierClient {
                         pending_publishes_map.clone(),
                         sent_queue_tx.clone(),
                         connection_state_tx.clone(),
+                        &mut recent_pkids,
                         #[cfg(feature = "metrics")]
                         metrics.clone(),
                     )
@@ -658,6 +666,7 @@ impl MqttierClient {
         pending_publishes_map: Arc<Mutex<HashMap<u16, PendingPublish>>>,
         sent_queue_tx: mpsc::Sender<u16>,
         connection_state_tx: watch::Sender<MqttConnectionState>,
+        recent_pkids: &mut VecDeque<u16>,
         #[cfg(feature = "metrics")] metrics: Arc<metrics::Metrics>,
     ) -> Result<()> {
         loop {
@@ -869,10 +878,21 @@ impl MqttierClient {
                     debug!("Outgoing event: {:?}", outgoing);
                     // If the outgoing packet is a Publish, extract its packet id and send it to sent_queue_tx
                     if let rumqttc::Outgoing::Publish(pkid) = outgoing {
-                        if let Err(e) = sent_queue_tx.send(pkid).await {
-                            error!("Failed to send pkid {} to sent_queue_tx: {}", pkid, e);
+                        // Check if this pkid was recently sent (e.g., after reconnection)
+                        if recent_pkids.contains(&pkid) {
+                            debug!("Skipping duplicate pkid {} (already sent recently)", pkid);
                         } else {
-                            debug!("Sent pkid {} to sent_queue_tx", pkid);
+                            // Track this pkid, keeping only the last 8
+                            if recent_pkids.len() >= 8 {
+                                recent_pkids.pop_front();
+                            }
+                            recent_pkids.push_back(pkid);
+
+                            if let Err(e) = sent_queue_tx.send(pkid).await {
+                                error!("Failed to send pkid {} to sent_queue_tx: {}", pkid, e);
+                            } else {
+                                debug!("Sent pkid {} to sent_queue_tx", pkid);
+                            }
                         }
                     }
                 }
