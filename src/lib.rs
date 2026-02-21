@@ -8,6 +8,12 @@ pub mod metrics;
 use async_trait::async_trait;
 use bytes::Bytes;
 use derive_builder::Builder;
+#[cfg(feature = "use-rustls")]
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+#[cfg(feature = "use-rustls")]
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+#[cfg(feature = "use-rustls")]
+use rustls::{DigitallySignedStruct, SignatureScheme};
 use rumqttc::v5::mqttbytes::v5::{LastWill, Packet, PublishProperties, SubscribeProperties};
 use rumqttc::v5::mqttbytes::QoS;
 use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
@@ -87,6 +93,31 @@ pub struct TcpConnection {
     pub port: u16,
 }
 
+#[cfg(feature = "use-rustls")]
+#[derive(Clone)]
+pub enum ServerCertificateVerification {
+    /// Ignore TLS/SSL verification
+    Insecure,
+    /// Use a CA certificate file (PEM format)
+    CaCertPath(String),
+}
+
+#[cfg(feature = "use-rustls")]
+/// TLS connection to a broker with certificates
+#[derive(Clone)]
+pub struct TlsConnection {
+    /// Hostname of the MQTT broker
+    pub hostname: String,
+    /// Port of the MQTT broker
+    pub port: u16,
+    /// Server certificate verification strategy
+    pub certificate_verification: ServerCertificateVerification,
+    /// Optional path to the client certificate file (PEM format) for mutual TLS
+    pub client_cert_path: Option<String>,
+    /// Optional path to the client key file (PEM format) for mutual TLS
+    pub client_key_path: Option<String>,
+}
+
 /// Specifies what type of connection to make to the broker.
 /// TLS and websocket connections not currently supported.
 #[derive(Clone)]
@@ -94,6 +125,15 @@ pub enum Connection {
     TcpLocalhost(u16),  // Specify the port of the localhost MQTT broker.
     UnixSocket(String), // Specify the path to the Unix socket.
     Tcp(TcpConnection), // Specify hostname and port.
+    #[cfg(feature = "use-rustls")]
+    TcpWithTls(TlsConnection), // Specify TLS connection details.
+}
+
+/// Credentials for authenticating with the MQTT broker
+#[derive(Clone)]
+pub struct Credentials {
+    pub username: String,
+    pub password: String,
 }
 
 /// Options for configuring the MqttierClient.
@@ -116,6 +156,63 @@ pub struct MqttierOptions {
     pub publish_queue_size: u16, // Size of the publish queue in number of messages.
     #[builder(default = "(10 * 1024)")]
     pub max_incoming_packet_size: u32,
+    #[builder(default = "None")]
+    pub credentials: Option<Credentials>,
+}
+
+#[cfg(feature = "use-rustls")]
+/// A TLS certificate verifier that accepts any certificate (use only in development/testing).
+#[derive(Debug)]
+struct NoopCertVerifier;
+
+#[cfg(feature = "use-rustls")]
+impl ServerCertVerifier for NoopCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> std::result::Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> std::result::Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::RSA_PKCS1_SHA1,
+            SignatureScheme::ECDSA_SHA1_Legacy,
+            SignatureScheme::RSA_PKCS1_SHA256,
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::RSA_PKCS1_SHA384,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::RSA_PKCS1_SHA512,
+            SignatureScheme::ECDSA_NISTP521_SHA512,
+            SignatureScheme::RSA_PSS_SHA256,
+            SignatureScheme::RSA_PSS_SHA384,
+            SignatureScheme::RSA_PSS_SHA512,
+            SignatureScheme::ED25519,
+            SignatureScheme::ED448,
+        ]
+    }
 }
 
 /// MqttierClient provides an abstracted, Clone-able interface around `rumqttc`.
@@ -204,6 +301,8 @@ impl MqttierClient {
                 Connection::TcpLocalhost(tcp_port) => ("localhost".to_string(), *tcp_port),
                 Connection::Tcp(conn) => (conn.hostname.clone(), conn.port),
                 Connection::UnixSocket(path) => (path.clone(), 0),
+                #[cfg(feature = "use-rustls")]
+                Connection::TcpWithTls(tls_conn) => (tls_conn.hostname.clone(), tls_conn.port),
             }
         };
 
@@ -212,8 +311,58 @@ impl MqttierClient {
         mqttoptions.set_clean_start(true);
         mqttoptions.set_max_packet_size(Some(mqttier_options.max_incoming_packet_size));
 
-        if let Connection::UnixSocket(_socket_path) = mqttier_options.connection {
+        if let Some(credentials) = &mqttier_options.credentials {
+            mqttoptions.set_credentials(credentials.username.clone(), credentials.password.clone());
+        }
+
+        if let Connection::UnixSocket(ref _socket_path) = mqttier_options.connection {
             mqttoptions.set_transport(rumqttc::Transport::Unix);
+        }
+
+        #[cfg(feature = "use-rustls")]
+        if let Connection::TcpWithTls(tls_conn) = &mqttier_options.connection {
+            // Build optional client auth from cert + key paths
+            let client_auth = match (&tls_conn.client_cert_path, &tls_conn.client_key_path) {
+                (Some(cert_path), Some(key_path)) => {
+                    match (std::fs::read(cert_path), std::fs::read(key_path)) {
+                        (Ok(cert), Ok(key)) => {
+                            debug!("Mutual TLS: loaded client cert and key");
+                            Some((cert, key))
+                        }
+                        _ => {
+                            error!("Failed to read client cert or key for mutual TLS");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
+
+            let transport = match &tls_conn.certificate_verification {
+                ServerCertificateVerification::Insecure => {
+                    warn!("TLS configured as Insecure: certificate verification is DISABLED");
+                    let config = rustls::ClientConfig::builder()
+                        .dangerous()
+                        .with_custom_certificate_verifier(Arc::new(NoopCertVerifier))
+                        .with_no_client_auth();
+                    rumqttc::Transport::tls_with_config(
+                        rumqttc::TlsConfiguration::Rustls(Arc::new(config)),
+                    )
+                }
+                ServerCertificateVerification::CaCertPath(ca_cert_path) => {
+                    match std::fs::read(ca_cert_path) {
+                        Ok(ca) => {
+                            debug!("TLS configured with CA certificate: {}", ca_cert_path);
+                            rumqttc::Transport::tls(ca, client_auth, None)
+                        }
+                        Err(e) => {
+                            error!("Failed to read CA certificate '{}': {}", ca_cert_path, e);
+                            rumqttc::Transport::tls_with_default_config()
+                        }
+                    }
+                }
+            };
+            mqttoptions.set_transport(transport);
         }
 
         let availability_helper = mqttier_options.availability_helper.unwrap_or_else(|| {
@@ -1291,6 +1440,8 @@ mod tests {
                 ),
             ),
             publish_queue_size: 128,
+            max_incoming_packet_size: 10 * 1024,
+            credentials: None,
         };
         let client = MqttierClient::new(options).unwrap();
         assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
@@ -1315,6 +1466,8 @@ mod tests {
                 ),
             ),
             publish_queue_size: 128,
+            max_incoming_packet_size: 10 * 1024,
+            credentials: None,
         };
         let _client = MqttierClient::new(options).unwrap();
         // If we get here without panic, the test passes
@@ -1343,6 +1496,8 @@ mod validation_tests {
                 ),
             ),
             publish_queue_size: 128,
+            max_incoming_packet_size: 10 * 1024,
+            credentials: None,
         };
 
         let client = MqttierClient::new(options).expect("Failed to create client");

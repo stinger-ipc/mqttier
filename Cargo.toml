@@ -1,6 +1,6 @@
 [package]
 name = "mqttier"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2021"
 authors = ["Jacob Brunson <github@jacobbrunson.com>"]
 description = "A Rust MQTT client library providing an abstracted interface around rumqttc."
@@ -14,9 +14,11 @@ homepage = "https://github.com/stinger-ipc/mqttier"
 
 [features]
 metrics = []
+use-rustls = ["dep:rustls", "rumqttc/use-rustls"]
 
 [dependencies]
-rumqttc = "0.24"
+rumqttc = { version = "0.24" }
+rustls = { version = "0.22", default-features = false, optional = true }
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
