@@ -93,6 +93,21 @@ pub struct TcpConnection {
     pub port: u16,
 }
 
+impl TcpConnection {
+    /// Create a `TcpConnection` from environment variables, falling back to provided defaults.
+    ///
+    /// Reads `MQTT_HOSTNAME` and `MQTT_PORT` from the environment.
+    /// Uses `default_hostname` and `default_port` if those variables are not set or invalid.
+    pub fn from_env_with_defaults(default_hostname: impl Into<String>, default_port: u16) -> Self {
+        let hostname = std::env::var("MQTT_HOSTNAME").unwrap_or_else(|_| default_hostname.into());
+        let port = std::env::var("MQTT_PORT")
+            .ok()
+            .and_then(|v| v.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        Self { hostname, port }
+    }
+}
+
 #[cfg(feature = "use-rustls")]
 #[derive(Clone)]
 pub enum ServerCertificateVerification {
