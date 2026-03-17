@@ -154,6 +154,8 @@ pub struct MqttierOptions {
     pub availability_helper: Option<stinger_mqtt_trait::availability::AvailabilityHelper>,
     #[builder(default = "128")]
     pub publish_queue_size: u16, // Size of the publish queue in number of messages.
+    #[builder(default = "32")]
+    pub max_inflight_messages: u16, // Maximum number of unacknowledged QoS 1 and QoS 2 messages that can be in-flight at once.
     #[builder(default = "(10 * 1024)")]
     pub max_incoming_packet_size: u32,
     #[builder(default = "None")]
@@ -310,6 +312,7 @@ impl MqttierClient {
         mqttoptions.set_keep_alive(Duration::from_secs(mqttier_options.keepalive_secs as u64));
         mqttoptions.set_clean_start(true);
         mqttoptions.set_max_packet_size(Some(mqttier_options.max_incoming_packet_size));
+        mqttoptions.set_outgoing_inflight_upper_limit(mqttier_options.max_inflight_messages);
 
         if let Some(credentials) = &mqttier_options.credentials {
             mqttoptions.set_credentials(credentials.username.clone(), credentials.password.clone());
