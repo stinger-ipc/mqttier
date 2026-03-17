@@ -1444,6 +1444,7 @@ mod tests {
             ),
             publish_queue_size: 128,
             max_incoming_packet_size: 10 * 1024,
+            max_inflight_messages: 100,
             credentials: None,
         };
         let client = MqttierClient::new(options).unwrap();
@@ -1470,6 +1471,7 @@ mod tests {
             ),
             publish_queue_size: 128,
             max_incoming_packet_size: 10 * 1024,
+            max_inflight_messages: 100,
             credentials: None,
         };
         let _client = MqttierClient::new(options).unwrap();
@@ -1500,6 +1502,7 @@ mod validation_tests {
             ),
             publish_queue_size: 128,
             max_incoming_packet_size: 10 * 1024,
+            max_inflight_messages: 100,
             credentials: None,
         };
 

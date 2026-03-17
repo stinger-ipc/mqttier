@@ -30,6 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ),
         publish_queue_size: 128,
         max_incoming_packet_size: 10 * 1024,
+        max_inflight_messages: 100,
         credentials: None,
     };
 
