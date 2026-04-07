@@ -14,10 +14,10 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(feature = "use-rustls")]
 use rustls::{DigitallySignedStruct, SignatureScheme};
-use rumqttc::v5::mqttbytes::v5::{LastWill, Packet, PublishProperties, SubscribeProperties};
-use rumqttc::v5::mqttbytes::QoS;
-use rumqttc::v5::{AsyncClient, Event, EventLoop, MqttOptions};
-use std::collections::{HashMap, VecDeque};
+use rumqttc::mqttbytes::v5::{LastWill, Packet, PublishProperties, SubscribeProperties};
+use rumqttc::mqttbytes::QoS;
+use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,9 +32,9 @@ use uuid::Uuid;
 #[derive(Error, Debug)]
 pub enum MqttierError {
     #[error("MQTT connection error: {0}")]
-    ConnectionError(#[from] rumqttc::v5::ConnectionError),
+    ConnectionError(#[from] rumqttc::ConnectionError),
     #[error("MQTT client error: {0}")]
-    ClientError(#[from] rumqttc::v5::ClientError),
+    ClientError(#[from] rumqttc::ClientError),
     #[error("Channel send error")]
     ChannelSendError,
     #[error("Invalid QoS value: {0}")]
@@ -279,9 +279,6 @@ impl MqttierClient {
     pub fn new(mqttier_options: MqttierOptions) -> Result<Self> {
         let client_id = mqttier_options.client_id;
 
-        // Create the sent queue channels (u16 packet ids)
-        let (sent_queue_tx, sent_queue_rx) =
-            mpsc::channel::<u16>(mqttier_options.publish_queue_size as usize);
         let (publish_queue_tx, publish_queue_rx) =
             mpsc::channel::<QueuedMessage>(mqttier_options.publish_queue_size as usize);
 
@@ -290,28 +287,22 @@ impl MqttierClient {
             ack_timeout_ms: mqttier_options.ack_timeout_ms,
         };
 
-        let (hostname, port) = {
-            match &mqttier_options.connection {
-                Connection::TcpLocalhost(tcp_port) => ("localhost".to_string(), *tcp_port),
-                Connection::Tcp(conn) => (conn.hostname.clone(), conn.port),
-                Connection::UnixSocket(path) => (path.clone(), 0),
-                #[cfg(feature = "use-rustls")]
-                Connection::TcpWithTls(tls_conn) => (tls_conn.hostname.clone(), tls_conn.port),
-            }
+        let broker = match &mqttier_options.connection {
+            Connection::TcpLocalhost(tcp_port) => Broker::tcp("localhost", *tcp_port),
+            Connection::Tcp(conn) => Broker::tcp(&conn.hostname, conn.port),
+            Connection::UnixSocket(path) => Broker::unix(path),
+            #[cfg(feature = "use-rustls")]
+            Connection::TcpWithTls(tls_conn) => Broker::tcp(&tls_conn.hostname, tls_conn.port),
         };
 
-        let mut mqttoptions = MqttOptions::new(client_id.clone(), hostname, port);
-        mqttoptions.set_keep_alive(Duration::from_secs(mqttier_options.keepalive_secs as u64));
+        let mut mqttoptions = MqttOptions::new(client_id.clone(), broker);
+        mqttoptions.set_keep_alive(mqttier_options.keepalive_secs);
         mqttoptions.set_clean_start(true);
         mqttoptions.set_max_packet_size(Some(mqttier_options.max_incoming_packet_size));
         mqttoptions.set_outgoing_inflight_upper_limit(mqttier_options.max_inflight_messages);
 
         if let Some(credentials) = &mqttier_options.credentials {
             mqttoptions.set_credentials(credentials.username.clone(), credentials.password.clone());
-        }
-
-        if let Connection::UnixSocket(ref _socket_path) = mqttier_options.connection {
-            mqttoptions.set_transport(rumqttc::Transport::Unix);
         }
 
         #[cfg(feature = "use-rustls")]
@@ -645,8 +636,12 @@ impl MqttierClient {
         debug!("Starting publish loop");
         // This should be the only publish loop, so we can lock the publish state here.
         let mut pub_state = publish_state.lock().await;
+        let ack_timeout_ms = pub_state.ack_timeout_ms;
 
-        while let Some(mut queued_message) = pub_state.publish_queue_rx.recv().await {
+        while let Some(queued_message) = pub_state.publish_queue_rx.recv().await {
+            #[cfg(feature = "metrics")]
+            let start_ts = queued_message.start_timestamp;
+
             MqttierClient::wait_for_connection(is_connected.clone()).await;
 
             let topic = queued_message.message.topic.clone();
@@ -687,15 +682,78 @@ impl MqttierClient {
                 pub_props.content_type = queued_message.message.content_type.clone();
             }
 
-            let publish_result: std::result::Result<(), rumqttc::v5::ClientError> = client
-                .publish_with_properties(
+            let completion = queued_message.completion;
+
+            match client
+                .publish_with_properties_tracked(
                     queued_message.message.topic,
                     qos,
                     queued_message.message.retain,
                     queued_message.message.payload,
                     pub_props,
                 )
-                .await;
+                .await
+            {
+                Ok(notice) => {
+                    #[cfg(feature = "metrics")]
+                    let metrics_spawn = metrics.clone();
+                    tokio::spawn(async move {
+                        match tokio::time::timeout(
+                            Duration::from_millis(ack_timeout_ms),
+                            notice.wait_async(),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                #[cfg(feature = "metrics")]
+                                {
+                                    let latency_us = start_ts.elapsed().as_micros() as u64;
+                                    metrics_spawn.record_publish_latency(latency_us);
+                                    metrics_spawn.record_message_published(qos_u8, payload_size);
+                                }
+                                if let Some(c) = completion {
+                                    let success = match qos {
+                                        QoS::AtMostOnce => MqttPublishSuccess::Sent,
+                                        QoS::AtLeastOnce => MqttPublishSuccess::Acknowledged,
+                                        QoS::ExactlyOnce => MqttPublishSuccess::Completed,
+                                    };
+                                    let _ = c.send(Ok(success));
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                error!("Publish notice error: {}", e);
+                                #[cfg(feature = "metrics")]
+                                metrics_spawn.increment_publish_failures();
+                                if let Some(c) = completion {
+                                    let _ = c.send(Err(
+                                        Mqtt5PubSubError::PublishError(format!("{}", e)),
+                                    ));
+                                }
+                            }
+                            Err(_) => {
+                                error!("Publish acknowledgment timed out after {}ms", ack_timeout_ms);
+                                #[cfg(feature = "metrics")]
+                                metrics_spawn.increment_publish_failures();
+                                if let Some(c) = completion {
+                                    let _ = c.send(Err(Mqtt5PubSubError::TimeoutError(
+                                        format!("Publish ack timeout after {}ms", ack_timeout_ms),
+                                    )));
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("Failed to publish message: {}", e);
+                    #[cfg(feature = "metrics")]
+                    metrics.increment_publish_failures();
+                    if let Some(c) = completion {
+                        let _ = c.send(Err(
+                            Mqtt5PubSubError::PublishError(format!("{}", e)),
+                        ));
+                    }
+                }
+            }
 
         }
     }
@@ -715,9 +773,7 @@ impl MqttierClient {
         loop {
             let poll_result = eventloop.poll().await;
             match poll_result {
-                Ok(Event::Outgoing(Packet::Publish(publish))) => {
-                    debug!("Outgoing publish packet ID: {:?}", publish.pkid);
-                }
+                Ok(Event::Outgoing(_)) => {}
                 Ok(Event::Incoming(Packet::ConnAck(_))) => {
                     {
                         let mut conn_guard = is_connected.write().await;
@@ -828,6 +884,7 @@ impl MqttierClient {
                         }
                     }
                 }
+                Ok(_) => {}
                 Err(e) => {
                     error!("Event loop error: {}", e);
                     return Err(MqttierError::ConnectionError(e));
