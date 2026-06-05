@@ -1,6 +1,6 @@
 [package]
 name = "mqttier"
-version = "0.8.0"
+version = "0.9.0"
 edition = "2021"
 authors = ["Jacob Brunson <github@jacobbrunson.com>"]
 description = "A Rust MQTT client library providing an abstracted interface around rumqttc."
@@ -18,18 +18,19 @@ use-rustls = ["dep:rustls", "rumqttc-v5-next/use-rustls"]
 
 [dependencies]
 rumqttc-v5-next = { version = "0.29" }
-rustls = { version = "0.22", default-features = false, optional = true }
+rustls = { version = "0.23", default-features = false, optional = true }
 tokio = { version = "1.0", features = ["full"] }
 tracing = "0.1"
 uuid = { version = "1.0", features = ["v4"] }
 thiserror = "1.0"
 derive_builder = "0.20"
 bytes = "1.10.1"
-stinger-mqtt-trait = { version = "0.6", features = ["availability_publish"] }
+jsonpath-rust = "0.7"
+stinger-mqtt-trait = { version = "0.7", features = ["availability_publish"] }
 async-trait = "0.1"
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-stinger-mqtt-trait = { version = "0.6", features = ["validation"] }
+stinger-mqtt-trait = { version = "0.7", features = ["validation"] }

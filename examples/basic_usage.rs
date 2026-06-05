@@ -2,6 +2,7 @@ use bytes::Bytes;
 use mqttier::{Connection, MqttierClient, MqttierOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS};
 use stinger_mqtt_trait::Mqtt5PubSub;
@@ -30,12 +31,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ack_timeout_ms: 5000,
         keepalive_secs: 60,
         session_expiry_interval_secs: 1200,
-        availability_helper: Some(
-            stinger_mqtt_trait::availability::AvailabilityHelper::client_availability(
-                "local".to_string(),
-                "basic_usage".to_string(),
-            ),
-        ),
+        availability_helper: Some(Arc::new(stinger_mqtt_trait::concrete::GenericAvailability::new(
+            "basic_usage",
+        ))),
         publish_queue_size: 128,
         max_incoming_packet_size: 10 * 1024,
         max_inflight_messages: 100,

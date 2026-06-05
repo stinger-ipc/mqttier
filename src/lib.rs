@@ -6,7 +6,6 @@
 pub mod metrics;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use derive_builder::Builder;
 #[cfg(feature = "use-rustls")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -14,15 +13,18 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(feature = "use-rustls")]
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use stinger_mqtt_trait::availability_trait::AvailabilityHelper as AvailabilityHelperTrait;
 use rumqttc::mqttbytes::v5::{LastWill, Packet, PublishProperties, SubscribeProperties};
 use rumqttc::mqttbytes::QoS;
 use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions};
+use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS as StingerQoS};
 use stinger_mqtt_trait::{Mqtt5PubSub, Mqtt5PubSubError, MqttConnectionState, MqttPublishSuccess};
+use stinger_mqtt_trait::concrete::GenericAvailability;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -151,7 +153,7 @@ pub struct MqttierOptions {
     #[builder(default = "1200")]
     pub session_expiry_interval_secs: u16,
     #[builder(default = "None")]
-    pub availability_helper: Option<stinger_mqtt_trait::availability::AvailabilityHelper>,
+    pub availability_helper: Option<Arc<dyn AvailabilityHelperTrait + Send + Sync>>,
     #[builder(default = "128")]
     pub publish_queue_size: u16, // Size of the publish queue in number of messages.
     #[builder(default = "32")]
@@ -259,9 +261,8 @@ pub struct MqttierClient {
     /// Connection state receiver for monitoring connection state
     connection_state_rx: watch::Receiver<MqttConnectionState>,
 
-
-    /// Availability helper for Home Assistant integration
-    availability_helper: Arc<stinger_mqtt_trait::availability::AvailabilityHelper>,
+    /// Optional availability helper for Home Assistant integration
+    availability_helper: Option<Arc<dyn AvailabilityHelperTrait + Send + Sync>>,
 
     /// Metrics collector
     #[cfg(feature = "metrics")]
@@ -351,25 +352,23 @@ impl MqttierClient {
             mqttoptions.set_transport(transport);
         }
 
-        let availability_helper = mqttier_options.availability_helper.unwrap_or_else(|| {
-            stinger_mqtt_trait::availability::AvailabilityHelper::client_availability(
-                "local".to_string(),
-                client_id.clone(),
-            )
-        });
-        let mut availability_helper_clone = availability_helper.clone();
-        let will_payload_bytes: Vec<u8> = match availability_helper_clone.get_message(false) {
-            Ok(msg) => msg.payload.to_vec(),
-            Err(_) => b"".to_vec(),
-        };
-        let will = LastWill::new(
-            availability_helper.get_topic(),
-            Bytes::from(will_payload_bytes),
-            QoS::AtLeastOnce,
-            true,
-            None,
-        );
-        mqttoptions.set_last_will(will);
+        let availability_helper = mqttier_options.availability_helper.clone();
+        if let Some(helper) = availability_helper.as_ref() {
+            let offline_message = helper.get_client_offline_message();
+            let will_qos = match offline_message.qos {
+                StingerQoS::AtMostOnce => QoS::AtMostOnce,
+                StingerQoS::AtLeastOnce => QoS::AtLeastOnce,
+                StingerQoS::ExactlyOnce => QoS::ExactlyOnce,
+            };
+            let will = LastWill::new(
+                offline_message.topic.clone(),
+                offline_message.payload.clone(),
+                will_qos,
+                offline_message.retain,
+                None,
+            );
+            mqttoptions.set_last_will(will);
+        }
 
         let (client, eventloop) = AsyncClient::new(mqttoptions.clone(), 10);
 
@@ -392,7 +391,7 @@ impl MqttierClient {
             connection_state_tx,
             connection_state_rx,
 
-            availability_helper: Arc::new(availability_helper),
+            availability_helper,
             #[cfg(feature = "metrics")]
             metrics: Arc::new(metrics::Metrics::new()),
         })
@@ -599,14 +598,21 @@ impl MqttierClient {
             }
         });
 
-        let this_client = self.clone();
-        tokio::spawn(async move {
-            stinger_mqtt_trait::availability::publish_online_availability_periodically(
-                this_client,
-                300,
-            )
-            .await;
-        });
+        if let Some(availability_helper) = self.availability_helper.clone() {
+            let this_client = self.clone();
+            tokio::spawn(async move {
+                let online_message = availability_helper.get_client_online_message();
+                let _ = this_client.clone().publish_nowait(online_message);
+
+                if let Some(interval) = availability_helper.get_republish_interval() {
+                    loop {
+                        tokio::time::sleep(interval).await;
+                        let online_message = availability_helper.get_client_online_message();
+                        let _ = this_client.clone().publish_nowait(online_message);
+                    }
+                }
+            });
+        }
 
         Ok(())
     }
@@ -1119,8 +1125,34 @@ impl Mqtt5PubSub for MqttierClient {
         Ok(MqttPublishSuccess::Sent)
     }
 
-    fn get_availability_helper(&mut self) -> stinger_mqtt_trait::availability::AvailabilityHelper {
-        (*self.availability_helper).clone()
+    fn get_availability_helper(&mut self) -> Option<Box<dyn AvailabilityHelperTrait>> {
+        self.availability_helper.as_ref().map(|helper| {
+            Box::new(ArcAvailabilityHelper {
+                inner: Arc::clone(helper),
+            }) as Box<dyn AvailabilityHelperTrait>
+        })
+    }
+}
+
+struct ArcAvailabilityHelper {
+    inner: Arc<dyn AvailabilityHelperTrait + Send + Sync>,
+}
+
+impl AvailabilityHelperTrait for ArcAvailabilityHelper {
+    fn get_client_online_message(&self) -> MqttMessage {
+        self.inner.get_client_online_message()
+    }
+
+    fn get_client_offline_message(&self) -> MqttMessage {
+        self.inner.get_client_offline_message()
+    }
+
+    fn get_online_json_path(&self) -> JsonPath {
+        self.inner.get_online_json_path()
+    }
+
+    fn get_republish_interval(&self) -> Option<Duration> {
+        self.inner.get_republish_interval()
     }
 }
 
@@ -1273,12 +1305,7 @@ mod tests {
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
             session_expiry_interval_secs: 1200,
-            availability_helper: Some(
-                stinger_mqtt_trait::availability::AvailabilityHelper::client_availability(
-                    "local".to_string(),
-                    "test_system".to_string(),
-                ),
-            ),
+            availability_helper: Some(Arc::new(GenericAvailability::new("test_system"))),
             publish_queue_size: 128,
             max_incoming_packet_size: 10 * 1024,
             max_inflight_messages: 100,
@@ -1300,12 +1327,7 @@ mod tests {
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
             session_expiry_interval_secs: 1200,
-            availability_helper: Some(
-                stinger_mqtt_trait::availability::AvailabilityHelper::client_availability(
-                    "local".to_string(),
-                    "test_system".to_string(),
-                ),
-            ),
+            availability_helper: Some(Arc::new(GenericAvailability::new("test_system"))),
             publish_queue_size: 128,
             max_incoming_packet_size: 10 * 1024,
             max_inflight_messages: 100,
@@ -1331,12 +1353,7 @@ mod validation_tests {
             ack_timeout_ms: 5000,
             keepalive_secs: 60,
             session_expiry_interval_secs: 1200,
-            availability_helper: Some(
-                stinger_mqtt_trait::availability::AvailabilityHelper::client_availability(
-                    "local".to_string(),
-                    "test_system".to_string(),
-                ),
-            ),
+            availability_helper: Some(Arc::new(GenericAvailability::new("test_system"))),
             publish_queue_size: 128,
             max_incoming_packet_size: 10 * 1024,
             max_inflight_messages: 100,
