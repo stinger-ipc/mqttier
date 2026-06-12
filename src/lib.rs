@@ -13,10 +13,14 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(feature = "use-rustls")]
 use rustls::{DigitallySignedStruct, SignatureScheme};
+#[cfg(feature = "lwt")]
 use stinger_mqtt_trait::availability_trait::AvailabilityHelper as AvailabilityHelperTrait;
-use rumqttc::mqttbytes::v5::{LastWill, Packet, PublishProperties, SubscribeProperties};
+use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
+#[cfg(feature = "lwt")]
+use rumqttc::mqttbytes::v5::LastWill;
 use rumqttc::mqttbytes::QoS;
 use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions};
+#[cfg(feature = "lwt")]
 use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -24,6 +28,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS as StingerQoS};
 use stinger_mqtt_trait::{Mqtt5PubSub, Mqtt5PubSubError, MqttConnectionState, MqttPublishSuccess};
+#[cfg(all(feature = "lwt", test))]
 use stinger_mqtt_trait::concrete::GenericAvailability;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
@@ -152,6 +157,7 @@ pub struct MqttierOptions {
     pub keepalive_secs: u16,
     #[builder(default = "1200")]
     pub session_expiry_interval_secs: u16,
+    #[cfg(feature = "lwt")]
     #[builder(default = "None")]
     pub availability_helper: Option<Arc<dyn AvailabilityHelperTrait + Send + Sync>>,
     #[builder(default = "128")]
@@ -262,6 +268,7 @@ pub struct MqttierClient {
     connection_state_rx: watch::Receiver<MqttConnectionState>,
 
     /// Optional availability helper for Home Assistant integration
+    #[cfg(feature = "lwt")]
     availability_helper: Option<Arc<dyn AvailabilityHelperTrait + Send + Sync>>,
 
     /// Metrics collector
@@ -352,7 +359,9 @@ impl MqttierClient {
             mqttoptions.set_transport(transport);
         }
 
+        #[cfg(feature = "lwt")]
         let availability_helper = mqttier_options.availability_helper.clone();
+        #[cfg(feature = "lwt")]
         if let Some(helper) = availability_helper.as_ref() {
             let offline_message = helper.get_client_offline_message();
             let will_qos = match offline_message.qos {
@@ -391,6 +400,7 @@ impl MqttierClient {
             connection_state_tx,
             connection_state_rx,
 
+            #[cfg(feature = "lwt")]
             availability_helper,
             #[cfg(feature = "metrics")]
             metrics: Arc::new(metrics::Metrics::new()),
@@ -598,6 +608,7 @@ impl MqttierClient {
             }
         });
 
+        #[cfg(feature = "lwt")]
         if let Some(availability_helper) = self.availability_helper.clone() {
             let this_client = self.clone();
             tokio::spawn(async move {
@@ -1125,6 +1136,7 @@ impl Mqtt5PubSub for MqttierClient {
         Ok(MqttPublishSuccess::Sent)
     }
 
+    #[cfg(feature = "lwt")]
     fn get_availability_helper(&mut self) -> Option<Box<dyn AvailabilityHelperTrait>> {
         self.availability_helper.as_ref().map(|helper| {
             Box::new(ArcAvailabilityHelper {
@@ -1134,10 +1146,12 @@ impl Mqtt5PubSub for MqttierClient {
     }
 }
 
+#[cfg(feature = "lwt")]
 struct ArcAvailabilityHelper {
     inner: Arc<dyn AvailabilityHelperTrait + Send + Sync>,
 }
 
+#[cfg(feature = "lwt")]
 impl AvailabilityHelperTrait for ArcAvailabilityHelper {
     fn get_client_online_message(&self) -> MqttMessage {
         self.inner.get_client_online_message()
@@ -1290,10 +1304,11 @@ impl MqttierClient {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lwt"))]
 mod tests {
     use super::*;
 
+    #[cfg(feature = "lwt")]
     #[tokio::test]
     async fn test_client_creation() {
         let options = MqttierOptions {
@@ -1315,6 +1330,7 @@ mod tests {
         assert_eq!(client.next_subscription_id.load(Ordering::SeqCst), 5);
     }
 
+    #[cfg(feature = "lwt")]
     #[tokio::test]
     async fn test_client_creation_with_id() {
         let client_id = "test_client".to_string();
@@ -1338,12 +1354,13 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "lwt"))]
 mod validation_tests {
     use super::*;
     use stinger_mqtt_trait::Mqtt5PubSub;
 
     /// Test that MqttierClient properly implements the MqttClient trait
+    #[cfg(feature = "lwt")]
     #[tokio::test]
     async fn test_mqtt_client_trait_implementation() {
         // This test verifies that MqttierClient implements the MqttClient trait correctly

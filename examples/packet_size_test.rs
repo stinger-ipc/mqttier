@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use mqttier::{Connection, MqttierClient, MqttierOptions};
+use mqttier::{Connection, MqttierClient, MqttierOptionsBuilder};
 use std::collections::HashMap;
 use std::error::Error;
 use stinger_mqtt_trait::message::{MqttMessageBuilder, QoS};
@@ -16,19 +16,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== MQTT Packet Size Test ===");
     println!("Testing maximum reliable packet size by incrementing payload by 1000 bytes\n");
 
-    // Create a new MQTT client using `MqttierOptions`
-    let options = MqttierOptions {
-        connection: Connection::TcpLocalhost(1883),
-        client_id: "packet_size_test".to_string(),
-        ack_timeout_ms: 5000,
-        keepalive_secs: 60,
-        session_expiry_interval_secs: 1200,
-        availability_helper: None,
-        publish_queue_size: 128,
-        max_incoming_packet_size: 2000,
-        max_inflight_messages: 100,
-        credentials: None,
-    };
+    // Create a new MQTT client using `MqttierOptionsBuilder`
+    let options = MqttierOptionsBuilder::default()
+        .connection(Connection::TcpLocalhost(1883))
+        .client_id("packet_size_test")
+        .ack_timeout_ms(5000u64)
+        .keepalive_secs(60u16)
+        .session_expiry_interval_secs(1200u16)
+        .publish_queue_size(128u16)
+        .max_incoming_packet_size(2000u32)
+        .max_inflight_messages(100u16)
+        .build()
+        .expect("Failed to build MqttierOptions");
     let mut client = MqttierClient::new(options)?;
 
     // Start the MQTT client loop

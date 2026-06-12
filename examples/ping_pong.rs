@@ -42,7 +42,7 @@
 //! ```
 
 use bytes::Bytes;
-use mqttier::{Connection, MqttierClient, MqttierOptions};
+use mqttier::{Connection, MqttierClient, MqttierOptionsBuilder};
 use std::collections::HashMap;
 use std::time::Duration;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS};
@@ -64,18 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     // Create a new MQTT client
-    let options = MqttierOptions {
-        connection: Connection::TcpLocalhost(1883),
-        client_id: "ping_pong_client".to_string(),
-        ack_timeout_ms: 5000,
-        keepalive_secs: 60,
-        session_expiry_interval_secs: 1200,
-        availability_helper: None,
-        publish_queue_size: 128,
-        max_incoming_packet_size: 10 * 1024,
-        max_inflight_messages: 100,
-        credentials: None,
-    };
+    let options = MqttierOptionsBuilder::default()
+        .connection(Connection::TcpLocalhost(1883))
+        .client_id("ping_pong_client")
+        .ack_timeout_ms(5000u64)
+        .keepalive_secs(60u16)
+        .session_expiry_interval_secs(1200u16)
+        .publish_queue_size(128u16)
+        .max_incoming_packet_size(10u32 * 1024)
+        .max_inflight_messages(100u16)
+        .build()
+        .expect("Failed to build MqttierOptions");
 
     let mut client = MqttierClient::new(options)?;
 

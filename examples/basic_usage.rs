@@ -1,8 +1,7 @@
 use bytes::Bytes;
-use mqttier::{Connection, MqttierClient, MqttierOptions};
+use mqttier::{Connection, MqttierClient, MqttierOptionsBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Duration;
 use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS};
 use stinger_mqtt_trait::Mqtt5PubSub;
@@ -24,21 +23,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
-    // Create a new MQTT client using `MqttierOptions`
-    let options = MqttierOptions {
-        connection: Connection::TcpLocalhost(1883),
-        client_id: "mqttc".to_string(),
-        ack_timeout_ms: 5000,
-        keepalive_secs: 60,
-        session_expiry_interval_secs: 1200,
-        availability_helper: Some(Arc::new(stinger_mqtt_trait::concrete::GenericAvailability::new(
-            "basic_usage",
-        ))),
-        publish_queue_size: 128,
-        max_incoming_packet_size: 10 * 1024,
-        max_inflight_messages: 100,
-        credentials: None,
-    };
+    // Create a new MQTT client using `MqttierOptionsBuilder`
+    #[allow(unused_mut)]
+    let mut options_builder = MqttierOptionsBuilder::default();
+    options_builder
+        .connection(Connection::TcpLocalhost(1883))
+        .client_id("mqttc")
+        .ack_timeout_ms(5000u64)
+        .keepalive_secs(60u16)
+        .session_expiry_interval_secs(1200u16)
+        .publish_queue_size(128u16)
+        .max_incoming_packet_size(10u32 * 1024)
+        .max_inflight_messages(100u16);
+    #[cfg(feature = "lwt")]
+    options_builder.availability_helper(Some(
+        std::sync::Arc::new(stinger_mqtt_trait::concrete::GenericAvailability::new("basic_usage"))
+            as std::sync::Arc<dyn stinger_mqtt_trait::availability_trait::AvailabilityHelper + Send + Sync>,
+    ));
+    let options = options_builder.build().expect("Failed to build MqttierOptions");
     let mut client = MqttierClient::new(options)?;
 
     // Create broadcast channel for receiving messages

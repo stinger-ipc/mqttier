@@ -6,7 +6,7 @@
 //! cargo run --example metrics_demo --features metrics
 //! ```
 
-use mqttier::{Connection, MqttierClient, MqttierOptions};
+use mqttier::{Connection, MqttierClient, MqttierOptionsBuilder};
 use stinger_mqtt_trait::Mqtt5PubSub;
 use tokio::time::{sleep, Duration};
 
@@ -16,18 +16,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     // Create client options
-    let options = MqttierOptions {
-        connection: Connection::TcpLocalhost(1883),
-        client_id: "metrics_demo_client".to_string(),
-        ack_timeout_ms: 5000,
-        keepalive_secs: 60,
-        session_expiry_interval_secs: 1200,
-        availability_helper: None,
-        publish_queue_size: 128,
-        max_incoming_packet_size: 10 * 1024,
-        max_inflight_messages: 100,
-        credentials: None,
-    };
+    let options = MqttierOptionsBuilder::default()
+        .connection(Connection::TcpLocalhost(1883))
+        .client_id("metrics_demo_client")
+        .ack_timeout_ms(5000u64)
+        .keepalive_secs(60u16)
+        .session_expiry_interval_secs(1200u16)
+        .publish_queue_size(128u16)
+        .max_incoming_packet_size(10u32 * 1024)
+        .max_inflight_messages(100u16)
+        .build()
+        .expect("Failed to build MqttierOptions");
 
     // Create the MQTT client
     let mut client = MqttierClient::new(options)?;
