@@ -15,9 +15,9 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 #[cfg(feature = "lwt")]
 use stinger_mqtt_trait::availability_trait::AvailabilityHelper as AvailabilityHelperTrait;
-use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties, LastWillProperties};
+use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
 #[cfg(feature = "lwt")]
-use rumqttc::mqttbytes::v5::LastWill;
+use rumqttc::mqttbytes::v5::{LastWill, LastWillProperties};
 use rumqttc::mqttbytes::QoS;
 use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions};
 #[cfg(feature = "lwt")]
