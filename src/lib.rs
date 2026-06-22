@@ -15,7 +15,7 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 #[cfg(feature = "lwt")]
 use stinger_mqtt_trait::availability_trait::AvailabilityHelper as AvailabilityHelperTrait;
-use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
+use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties, LastWillProperties};
 #[cfg(feature = "lwt")]
 use rumqttc::mqttbytes::v5::LastWill;
 use rumqttc::mqttbytes::QoS;
@@ -160,6 +160,8 @@ pub struct MqttierOptions {
     #[cfg(feature = "lwt")]
     #[builder(default = "None")]
     pub availability_helper: Option<Arc<dyn AvailabilityHelperTrait + Send + Sync>>,
+    #[builder(default = "10")]
+    pub lwt_delay_secs: u16, // Delay before sending LWT message after disconnect.
     #[builder(default = "128")]
     pub publish_queue_size: u16, // Size of the publish queue in number of messages.
     #[builder(default = "32")]
@@ -369,12 +371,21 @@ impl MqttierClient {
                 StingerQoS::AtLeastOnce => QoS::AtLeastOnce,
                 StingerQoS::ExactlyOnce => QoS::ExactlyOnce,
             };
+            let last_will_properties = LastWillProperties {
+                delay_interval: Some(mqttier_options.lwt_delay_secs as u32),
+                payload_format_indicator: None,
+                message_expiry_interval: offline_message.message_expiry_interval,
+                content_type: offline_message.content_type.clone(),
+                response_topic: offline_message.response_topic.clone(),
+                correlation_data: offline_message.correlation_data.clone(),
+                user_properties: offline_message.user_properties.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            };
             let will = LastWill::new(
                 offline_message.topic.clone(),
                 offline_message.payload.clone(),
                 will_qos,
                 offline_message.retain,
-                None,
+                Some(last_will_properties),
             );
             mqttoptions.set_last_will(will);
         }
