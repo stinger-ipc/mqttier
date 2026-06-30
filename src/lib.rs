@@ -7,29 +7,29 @@ pub mod metrics;
 
 use async_trait::async_trait;
 use derive_builder::Builder;
+#[cfg(feature = "lwt")]
+use jsonpath_rust::JsonPath;
+#[cfg(feature = "lwt")]
+use rumqttc::mqttbytes::v5::{LastWill, LastWillProperties};
+use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
+use rumqttc::mqttbytes::QoS;
+use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions};
 #[cfg(feature = "use-rustls")]
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 #[cfg(feature = "use-rustls")]
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 #[cfg(feature = "use-rustls")]
 use rustls::{DigitallySignedStruct, SignatureScheme};
-#[cfg(feature = "lwt")]
-use stinger_mqtt_trait::availability_trait::AvailabilityHelper as AvailabilityHelperTrait;
-use rumqttc::mqttbytes::v5::{Packet, PublishProperties, SubscribeProperties};
-#[cfg(feature = "lwt")]
-use rumqttc::mqttbytes::v5::{LastWill, LastWillProperties};
-use rumqttc::mqttbytes::QoS;
-use rumqttc::{AsyncClient, Broker, Event, EventLoop, MqttOptions};
-#[cfg(feature = "lwt")]
-use jsonpath_rust::JsonPath;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS as StingerQoS};
-use stinger_mqtt_trait::{Mqtt5PubSub, Mqtt5PubSubError, MqttConnectionState, MqttPublishSuccess};
+#[cfg(feature = "lwt")]
+use stinger_mqtt_trait::availability_trait::AvailabilityHelper as AvailabilityHelperTrait;
 #[cfg(all(feature = "lwt", test))]
 use stinger_mqtt_trait::concrete::GenericAvailability;
+use stinger_mqtt_trait::message::{MqttMessage, MqttMessageBuilder, QoS as StingerQoS};
+use stinger_mqtt_trait::{Mqtt5PubSub, Mqtt5PubSubError, MqttConnectionState, MqttPublishSuccess};
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tracing::{debug, error, info, warn};
@@ -46,13 +46,14 @@ pub enum MqttierError {
     ChannelSendError,
     #[error("Invalid QoS value: {0}")]
     InvalidQos(u8),
+    #[error("Subscribe error: {0}")]
+    SubscribeError(String),
 }
 
 type Result<T> = std::result::Result<T, MqttierError>;
 
 /// Completion signal for a published message
 type PublishCompletion = oneshot::Sender<std::result::Result<MqttPublishSuccess, Mqtt5PubSubError>>;
-
 
 /// Represents a queued subscription
 #[derive(Debug, Clone)]
@@ -246,10 +247,10 @@ pub struct MqttierClient {
     /// Keep track of connection state.
     is_connected: Arc<RwLock<bool>>,
 
-    /// Keeps track of active subscriptions, but subscription_id and a channel sender.
+    /// Keeps track of active subscriptions, by subscription_id and the channel senders.
     /// When a message is received with a subscription_id, an MqttMessage object is
-    /// created and sent to the channel.
-    subscriptions: Arc<Mutex<HashMap<usize, broadcast::Sender<MqttMessage>>>>,
+    /// created and sent to every channel registered for that subscription_id.
+    subscriptions: Arc<Mutex<HashMap<usize, Vec<broadcast::Sender<MqttMessage>>>>>,
 
     /// Maps topics to their active subscription IDs.
     topic_to_subscription_ids: Arc<Mutex<HashMap<String, Vec<usize>>>>,
@@ -341,9 +342,9 @@ impl MqttierClient {
                         .dangerous()
                         .with_custom_certificate_verifier(Arc::new(NoopCertVerifier))
                         .with_no_client_auth();
-                    rumqttc::Transport::tls_with_config(
-                        rumqttc::TlsConfiguration::Rustls(Arc::new(config)),
-                    )
+                    rumqttc::Transport::tls_with_config(rumqttc::TlsConfiguration::Rustls(
+                        Arc::new(config),
+                    ))
                 }
                 ServerCertificateVerification::CaCertPath(ca_cert_path) => {
                     match std::fs::read(ca_cert_path) {
@@ -378,7 +379,11 @@ impl MqttierClient {
                 content_type: offline_message.content_type.clone(),
                 response_topic: offline_message.response_topic.clone(),
                 correlation_data: offline_message.correlation_data.clone(),
-                user_properties: offline_message.user_properties.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                user_properties: offline_message
+                    .user_properties
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
             };
             let will = LastWill::new(
                 offline_message.topic.clone(),
@@ -450,66 +455,26 @@ impl MqttierClient {
     /// - `received_message_tx`: broadcast Sender that will receive `MqttMessage`s for this subscription
     ///
     /// Returns: subscription id (usize) on success.
+    ///
+    /// This is a thin convenience wrapper around the [`Mqtt5PubSub::subscribe`]
+    /// implementation, which holds the actual subscription logic.
     pub async fn subscribe(
-        &self,
+        &mut self,
         topic: String,
         qos: u8,
         received_message_tx: broadcast::Sender<MqttMessage>,
     ) -> Result<usize> {
-        let subscription_id = self.next_subscription_id();
-        {
-            let mut subs = self.subscriptions.lock().await;
-            subs.insert(subscription_id, received_message_tx);
-        }
-        {
-            let mut tmap = self.topic_to_subscription_ids.lock().await;
-            tmap.entry(topic.clone())
-                .or_insert_with(Vec::new)
-                .push(subscription_id);
-        }
-        let subscription_props = SubscribeProperties {
-            id: Some(subscription_id),
-            user_properties: Vec::new(),
-        };
-        let rumqttc_qos = match qos {
-            0 => QoS::AtMostOnce,
-            1 => QoS::AtLeastOnce,
-            2 => QoS::ExactlyOnce,
+        let stinger_qos = match qos {
+            0 => StingerQoS::AtMostOnce,
+            1 => StingerQoS::AtLeastOnce,
+            2 => StingerQoS::ExactlyOnce,
             _ => return Err(MqttierError::InvalidQos(qos)),
         };
-        #[cfg(feature = "metrics")]
-        self.metrics.increment_subscription_requests();
-        let connected = { *self.is_connected.read().await };
-        if connected {
-            debug!("Subscribing to topic: {} with QoS: {:?}", topic, qos);
-            match self
-                .client
-                .subscribe_with_properties(&topic, rumqttc_qos, subscription_props)
+        let subscription_id =
+            <Self as Mqtt5PubSub>::subscribe(self, topic, stinger_qos, received_message_tx)
                 .await
-            {
-                Ok(_) => {
-                    #[cfg(feature = "metrics")]
-                    self.metrics.increment_active_subscriptions();
-                }
-                Err(e) => {
-                    #[cfg(feature = "metrics")]
-                    self.metrics.increment_subscription_failures();
-                    return Err(e.into());
-                }
-            }
-        } else {
-            debug!(
-                "Queueing subscription for topic: {} with QoS: {:?}",
-                topic, qos
-            );
-            let mut queued = self.queued_subscriptions.lock().await;
-            queued.push(QueuedSubscription {
-                topic,
-                qos: rumqttc_qos,
-                props: subscription_props,
-            });
-        }
-        Ok(subscription_id)
+                .map_err(|e| MqttierError::SubscribeError(e.to_string()))?;
+        Ok(subscription_id as usize)
     }
 
     /// Start the run loop for handling MQTT connections and messages
@@ -525,7 +490,6 @@ impl MqttierClient {
         let client = self.client.clone();
         let is_connected = self.is_connected.clone();
         let subscriptions = self.subscriptions.clone();
-        let topic_to_subscription_ids = self.topic_to_subscription_ids.clone();
         let queued_subscriptions = self.queued_subscriptions.clone();
         let eventloop = self.eventloop.clone();
         let publish_state = self.publish_state.clone();
@@ -569,7 +533,6 @@ impl MqttierClient {
                         &mut el,
                         is_connected.clone(),
                         subscriptions.clone(),
-                        topic_to_subscription_ids.clone(),
                         queued_subscriptions.clone(),
                         connection_state_tx.clone(),
                         #[cfg(feature = "metrics")]
@@ -753,19 +716,24 @@ impl MqttierClient {
                                 #[cfg(feature = "metrics")]
                                 metrics_spawn.increment_publish_failures();
                                 if let Some(c) = completion {
-                                    let _ = c.send(Err(
-                                        Mqtt5PubSubError::PublishError(format!("{}", e)),
-                                    ));
+                                    let _ = c.send(Err(Mqtt5PubSubError::PublishError(format!(
+                                        "{}",
+                                        e
+                                    ))));
                                 }
                             }
                             Err(_) => {
-                                error!("Publish acknowledgment timed out after {}ms", ack_timeout_ms);
+                                error!(
+                                    "Publish acknowledgment timed out after {}ms",
+                                    ack_timeout_ms
+                                );
                                 #[cfg(feature = "metrics")]
                                 metrics_spawn.increment_publish_failures();
                                 if let Some(c) = completion {
-                                    let _ = c.send(Err(Mqtt5PubSubError::TimeoutError(
-                                        format!("Publish ack timeout after {}ms", ack_timeout_ms),
-                                    )));
+                                    let _ = c.send(Err(Mqtt5PubSubError::TimeoutError(format!(
+                                        "Publish ack timeout after {}ms",
+                                        ack_timeout_ms
+                                    ))));
                                 }
                             }
                         }
@@ -776,13 +744,10 @@ impl MqttierClient {
                     #[cfg(feature = "metrics")]
                     metrics.increment_publish_failures();
                     if let Some(c) = completion {
-                        let _ = c.send(Err(
-                            Mqtt5PubSubError::PublishError(format!("{}", e)),
-                        ));
+                        let _ = c.send(Err(Mqtt5PubSubError::PublishError(format!("{}", e))));
                     }
                 }
             }
-
         }
     }
 
@@ -792,8 +757,7 @@ impl MqttierClient {
         client: &AsyncClient,
         eventloop: &mut EventLoop,
         is_connected: Arc<RwLock<bool>>,
-        subscriptions: Arc<Mutex<HashMap<usize, broadcast::Sender<MqttMessage>>>>,
-        _topic_to_subscription_ids: Arc<Mutex<HashMap<String, Vec<usize>>>>,
+        subscriptions: Arc<Mutex<HashMap<usize, Vec<broadcast::Sender<MqttMessage>>>>>,
         queued_subscriptions: Arc<Mutex<Vec<QueuedSubscription>>>,
         connection_state_tx: watch::Sender<MqttConnectionState>,
         #[cfg(feature = "metrics")] metrics: Arc<metrics::Metrics>,
@@ -876,6 +840,7 @@ impl MqttierClient {
                             metrics.record_message_received(qos_u8, payload_size);
                         }
 
+                        // A message may match multiple subscription ids, so we need to handle each matching subscription.
                         for subscription_id in subscription_ids {
                             // Collect user properties into a HashMap (last value wins for duplicate keys)
                             let mut user_props_map: HashMap<String, String> = HashMap::new();
@@ -883,6 +848,7 @@ impl MqttierClient {
                                 user_props_map.insert(k.clone(), v.clone());
                             }
 
+                            // Reform the received data into our MqttMessage struct.
                             let message = MqttMessageBuilder::default()
                                 .topic(&topic_str)
                                 .payload(publish.payload.clone())
@@ -900,13 +866,14 @@ impl MqttierClient {
                                 .build()
                                 .unwrap();
                             let subs_guard = subscriptions.lock().await;
-                            if let Some(sender) = subs_guard.get(&subscription_id) {
-                                let send_result = sender.send(message.clone());
-                                if let Err(e) = send_result {
-                                    warn!(
-                                        "Failed to send message to subscription {}: {}",
-                                        subscription_id, e
-                                    );
+                            if let Some(senders) = subs_guard.get(&subscription_id) {
+                                for sender in senders.iter() {
+                                    if let Err(e) = sender.send(message.clone()) {
+                                        warn!(
+                                            "Failed to send message to subscription {}: {}",
+                                            subscription_id, e
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -945,13 +912,27 @@ impl Mqtt5PubSub for MqttierClient {
             stinger_mqtt_trait::message::QoS::ExactlyOnce => QoS::ExactlyOnce,
         };
 
+        // If we're already subscribed to this topic, add the sender to the existing
+        // subscription and return the existing subscription id.
+        let existing_id = {
+            let tmap = self.topic_to_subscription_ids.lock().await;
+            tmap.get(&topic).and_then(|ids| ids.first().copied())
+        };
+        if let Some(existing_id) = existing_id {
+            let mut subs = self.subscriptions.lock().await;
+            subs.entry(existing_id).or_insert_with(Vec::new).push(tx);
+            return Ok(existing_id as u32);
+        }
+
         // Get subscription ID
         let subscription_id = self.next_subscription_id();
 
         // Register the subscription
         {
             let mut subs = self.subscriptions.lock().await;
-            subs.insert(subscription_id, tx);
+            subs.entry(subscription_id)
+                .or_insert_with(Vec::new)
+                .push(tx);
         }
         {
             let mut tmap = self.topic_to_subscription_ids.lock().await;
@@ -1076,7 +1057,7 @@ impl Mqtt5PubSub for MqttierClient {
                 "Completion channel closed".to_string(),
             )),
             Err(_) => Err(Mqtt5PubSubError::TimeoutError(
-                "Publish completion timeout after 50000ms".to_string()
+                "Publish completion timeout after 50000ms".to_string(),
             )),
         }
     }

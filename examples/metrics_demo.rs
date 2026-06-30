@@ -7,7 +7,6 @@
 //! ```
 
 use mqttier::{Connection, MqttierClient, MqttierOptionsBuilder};
-use stinger_mqtt_trait::Mqtt5PubSub;
 use tokio::time::{sleep, Duration};
 
 #[tokio::main]

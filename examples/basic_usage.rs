@@ -36,11 +36,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_incoming_packet_size(10u32 * 1024)
         .max_inflight_messages(100u16);
     #[cfg(feature = "lwt")]
-    options_builder.availability_helper(Some(
-        std::sync::Arc::new(stinger_mqtt_trait::concrete::GenericAvailability::new("basic_usage"))
-            as std::sync::Arc<dyn stinger_mqtt_trait::availability_trait::AvailabilityHelper + Send + Sync>,
-    ));
-    let options = options_builder.build().expect("Failed to build MqttierOptions");
+    options_builder.availability_helper(Some(std::sync::Arc::new(
+        stinger_mqtt_trait::concrete::GenericAvailability::new("basic_usage"),
+    )
+        as std::sync::Arc<
+            dyn stinger_mqtt_trait::availability_trait::AvailabilityHelper + Send + Sync,
+        >));
+    let options = options_builder
+        .build()
+        .expect("Failed to build MqttierOptions");
     let mut client = MqttierClient::new(options)?;
 
     // Create broadcast channel for receiving messages

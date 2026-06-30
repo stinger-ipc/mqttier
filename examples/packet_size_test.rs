@@ -39,14 +39,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut size = 1000;
     let increment = 1000;
     let mut last_successful_size = 0;
-    
+
     loop {
         // Create payload of the current size
         let payload_data: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
         let payload = Bytes::from(payload_data);
-        
+
         println!("Testing packet size: {} bytes", size);
-        
+
         let message = MqttMessageBuilder::default()
             .topic("test/packet_size")
             .payload(payload)
@@ -61,7 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match client.publish(message).await {
             Ok(result) => {
                 let elapsed = start.elapsed();
-                println!("✓ Success! Size: {} bytes - Acknowledged in {:?}", size, elapsed);
+                println!(
+                    "✓ Success! Size: {} bytes - Acknowledged in {:?}",
+                    size, elapsed
+                );
                 println!("  Result: {:?}\n", result);
                 last_successful_size = size;
             }
@@ -77,7 +80,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  Error: {:?}", e);
                 println!("  Display: {}", e);
                 println!("  Debug representation: {:#?}", e);
-                
+
                 // Try to extract source errors
                 let mut source = e.source();
                 let mut level = 1;
@@ -87,21 +90,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     source = err.source();
                     level += 1;
                 }
-                
+
                 println!("\n========================================");
                 println!("SUMMARY");
                 println!("========================================");
-                println!("Maximum successful packet size: {} bytes", last_successful_size);
+                println!(
+                    "Maximum successful packet size: {} bytes",
+                    last_successful_size
+                );
                 println!("Failed at packet size: {} bytes", size);
                 println!("========================================\n");
-                
+
                 break;
             }
         }
-        
+
         // Increment size for next iteration
         size += increment;
-        
+
         // Optional: add a small delay between publishes to avoid overwhelming the broker
         tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
     }
